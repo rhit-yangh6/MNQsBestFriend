@@ -169,6 +169,96 @@ def fetch_by_contract_expiries(fetcher, years: int, bar_size: str, use_rth: bool
     return combined
 
 
+def fetch_historical_backwards(fetcher, end_date: datetime, total_days: int, bar_size: str, use_rth: bool, chunk_days: int = 5) -> pd.DataFrame:
+    """
+    Fetch historical data going backwards from a specific end date.
+    Uses front-month contract with chunked requests.
+
+    Args:
+        fetcher: IBKRDataFetcher instance
+        end_date: End date to start fetching backwards from
+        total_days: Total days of data to fetch
+        bar_size: Bar size string
+        use_rth: Regular trading hours only
+        chunk_days: Days per chunk
+
+    Returns:
+        Combined DataFrame
+    """
+    from ib_insync import util
+
+    all_data = []
+    current_end = end_date
+    days_fetched = 0
+    total_chunks = (total_days + chunk_days - 1) // chunk_days
+    chunk_num = 0
+    consecutive_fails = 0
+    max_consecutive_fails = 15
+
+    contract = fetcher._contract
+    logger.info(f"Fetching {total_days} days backwards from {end_date.strftime('%Y-%m-%d')}")
+    logger.info(f"Using {chunk_days}-day chunks (~{total_chunks} requests)")
+    logger.info(f"Estimated time: {total_chunks * 3 / 60:.1f} minutes\n")
+
+    while days_fetched < total_days:
+        chunk_num += 1
+        progress = days_fetched / total_days * 100
+
+        try:
+            print(f"\r[{chunk_num}/{total_chunks}] {progress:.1f}% - {current_end.strftime('%Y-%m-%d')}...", end="", flush=True)
+
+            bars = fetcher.ib.reqHistoricalData(
+                contract=contract,
+                endDateTime=current_end,
+                durationStr=f"{chunk_days} D",
+                barSizeSetting=bar_size,
+                whatToShow="TRADES",
+                useRTH=use_rth,
+                formatDate=1,
+                timeout=60,
+            )
+
+            if bars:
+                df_chunk = util.df(bars)
+                all_data.append(df_chunk)
+                print(f"\r[{chunk_num}/{total_chunks}] {progress:.1f}% - {current_end.strftime('%Y-%m-%d')}: {len(df_chunk)} bars", flush=True)
+                consecutive_fails = 0
+            else:
+                print(f"\r[{chunk_num}/{total_chunks}] {progress:.1f}% - {current_end.strftime('%Y-%m-%d')}: No data", flush=True)
+                consecutive_fails += 1
+
+            current_end = current_end - timedelta(days=chunk_days)
+            days_fetched += chunk_days
+            time.sleep(2.5)
+
+        except Exception as e:
+            consecutive_fails += 1
+            err_msg = str(e)[:40]
+            print(f"\r[{chunk_num}/{total_chunks}] {progress:.1f}% - {current_end.strftime('%Y-%m-%d')}: {err_msg}", flush=True)
+            current_end = current_end - timedelta(days=chunk_days)
+            days_fetched += chunk_days
+            time.sleep(5)
+
+        if consecutive_fails >= max_consecutive_fails:
+            logger.warning(f"\n{max_consecutive_fails} consecutive failures - may have reached data limit")
+            break
+
+    print()
+
+    if not all_data:
+        return pd.DataFrame()
+
+    combined = pd.concat(all_data, ignore_index=True)
+    combined = combined.drop_duplicates(subset=['date'])
+    combined = combined.sort_values('date')
+
+    logger.info(f"Fetched {len(combined)} bars")
+    if len(combined) > 0:
+        logger.info(f"Date range: {combined['date'].min()} to {combined['date'].max()}")
+
+    return combined
+
+
 def fetch_in_chunks(fetcher, total_days: int, bar_size: str, use_rth: bool, chunk_days: int = 5) -> pd.DataFrame:
     """
     Fetch historical data in chunks using front-month contract.
@@ -309,6 +399,18 @@ def main():
         action="store_true",
         help="Use continuous contract (deprecated, use chunked fetching instead)",
     )
+    parser.add_argument(
+        "--extend",
+        type=str,
+        default=None,
+        help="Extend existing data file by fetching older data",
+    )
+    parser.add_argument(
+        "--end-date",
+        type=str,
+        default=None,
+        help="End date for historical fetch (YYYY-MM-DD), default is now",
+    )
 
     args = parser.parse_args()
 
@@ -326,9 +428,45 @@ def main():
     else:
         total_days = 365  # Default 1 year
 
+    # Parse end date if provided
+    end_date = None
+    if args.end_date:
+        end_date = datetime.strptime(args.end_date, "%Y-%m-%d")
+
     try:
         with IBKRDataFetcher(paper=args.paper) as fetcher:
-            if args.update:
+            if args.extend:
+                # Extend existing data by fetching older data
+                logger.info(f"Extending data file: {args.extend}")
+                existing_df = pd.read_parquet(settings.DATA_DIR / args.extend)
+                oldest_date = existing_df.index.min()
+                logger.info(f"Existing data starts at: {oldest_date}")
+
+                # Fetch data ending at the oldest existing date
+                fetcher.get_mnq_contract(expiry=args.expiry)
+                df = fetch_historical_backwards(
+                    fetcher=fetcher,
+                    end_date=oldest_date.to_pydatetime().replace(tzinfo=None),
+                    total_days=total_days,
+                    bar_size=args.bar_size,
+                    use_rth=args.rth_only,
+                )
+
+                if not df.empty:
+                    df = fetcher._process_bar_data(df)
+
+                    # Combine with existing
+                    logger.info("Combining with existing data...")
+                    combined = pd.concat([df, existing_df])
+                    combined = combined[~combined.index.duplicated(keep='last')]
+                    combined = combined.sort_index()
+                    df = combined
+                    logger.info(f"Combined data: {len(df)} rows, {df.index.min()} to {df.index.max()}")
+                else:
+                    logger.error("No older data fetched")
+                    return 1
+
+            elif args.update:
                 # Update existing file
                 fetcher.get_mnq_contract(expiry=args.expiry)
                 logger.info(f"Updating existing file: {args.update}")
