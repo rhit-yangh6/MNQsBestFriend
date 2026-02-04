@@ -22,9 +22,157 @@ import pandas as pd
 logger = setup_logger("fetch_data", level="INFO")
 
 
-def fetch_in_chunks(fetcher, total_days: int, bar_size: str, use_rth: bool, chunk_days: int = 5, use_continuous: bool = False) -> pd.DataFrame:
+def fetch_continuous_all_at_once(fetcher, years: int, bar_size: str, use_rth: bool) -> pd.DataFrame:
     """
-    Fetch historical data in chunks to avoid IBKR limitations.
+    Fetch multi-year data using continuous contract in one request.
+    IBKR continuous contracts don't allow endDateTime, so we fetch everything at once.
+
+    Args:
+        fetcher: IBKRDataFetcher instance
+        years: Number of years to fetch
+        bar_size: Bar size string
+        use_rth: Regular trading hours only
+
+    Returns:
+        DataFrame with historical data
+    """
+    from ib_insync import ContFuture, util
+
+    contract = ContFuture(
+        symbol=settings.SYMBOL,
+        exchange=settings.EXCHANGE,
+        currency=settings.CURRENCY,
+    )
+
+    logger.info(f"Fetching {years} years of data using CONTINUOUS contract...")
+    logger.info(f"This may take a few minutes. Please wait...")
+
+    try:
+        bars = fetcher.ib.reqHistoricalData(
+            contract=contract,
+            endDateTime="",  # Must be empty for ContFuture
+            durationStr=f"{years} Y",
+            barSizeSetting=bar_size,
+            whatToShow="TRADES",
+            useRTH=use_rth,
+            formatDate=1,
+            timeout=600,  # 10 minute timeout for large requests
+        )
+
+        if bars:
+            df = util.df(bars)
+            logger.info(f"Got {len(df)} bars")
+            return df
+        else:
+            logger.warning("No data returned from continuous contract")
+            return pd.DataFrame()
+
+    except Exception as e:
+        logger.error(f"Error fetching continuous data: {e}")
+        return pd.DataFrame()
+
+
+def fetch_by_contract_expiries(fetcher, years: int, bar_size: str, use_rth: bool, chunk_days: int = 5) -> pd.DataFrame:
+    """
+    Fetch historical data using available contracts from IBKR.
+    First discovers what contracts are available, then fetches from each.
+
+    Args:
+        fetcher: IBKRDataFetcher instance
+        years: Number of years to fetch (used as a guide)
+        bar_size: Bar size string
+        use_rth: Regular trading hours only
+        chunk_days: Days per chunk within each contract
+
+    Returns:
+        Combined DataFrame
+    """
+    from ib_insync import Future, util
+
+    all_data = []
+
+    # First, discover what contracts are actually available
+    logger.info("Discovering available MNQ contracts...")
+
+    base_contract = Future(
+        symbol=settings.SYMBOL,
+        exchange=settings.EXCHANGE,
+        currency=settings.CURRENCY,
+    )
+
+    details = fetcher.ib.reqContractDetails(base_contract)
+
+    if not details:
+        logger.error("No contracts found!")
+        return pd.DataFrame()
+
+    # Sort by expiry and get available contracts
+    available_contracts = sorted(
+        [d.contract for d in details],
+        key=lambda c: c.lastTradeDateOrContractMonth
+    )
+
+    logger.info(f"Found {len(available_contracts)} available contracts")
+
+    # Fetch from each available contract
+    for i, contract in enumerate(available_contracts):
+        expiry = contract.lastTradeDateOrContractMonth
+        logger.info(f"[{i+1}/{len(available_contracts)}] Fetching {contract.localSymbol} ({expiry})...")
+
+        try:
+            # Fetch maximum available data for this contract
+            # Try different durations, starting with largest
+            for duration in ["1 Y", "6 M", "3 M", "1 M"]:
+                try:
+                    bars = fetcher.ib.reqHistoricalData(
+                        contract=contract,
+                        endDateTime="",
+                        durationStr=duration,
+                        barSizeSetting=bar_size,
+                        whatToShow="TRADES",
+                        useRTH=use_rth,
+                        formatDate=1,
+                        timeout=120,
+                    )
+
+                    if bars:
+                        df_chunk = util.df(bars)
+                        all_data.append(df_chunk)
+                        logger.info(f"  Got {len(df_chunk)} bars ({duration}): {df_chunk['date'].min()} to {df_chunk['date'].max()}")
+                        break
+
+                except Exception as e:
+                    if "pacing" in str(e).lower():
+                        logger.warning(f"  Pacing violation, waiting...")
+                        time.sleep(10)
+                    continue
+
+            # Pace requests
+            time.sleep(3)
+
+        except Exception as e:
+            logger.warning(f"  Error fetching {expiry}: {e}")
+            time.sleep(5)
+
+    if not all_data:
+        return pd.DataFrame()
+
+    # Combine all contracts
+    combined = pd.concat(all_data, ignore_index=True)
+    combined = combined.drop_duplicates(subset=['date'])
+    combined = combined.sort_values('date')
+
+    logger.info(f"Total: {len(combined)} bars from {len(all_data)} contracts")
+    if len(combined) > 0:
+        logger.info(f"Date range: {combined['date'].min()} to {combined['date'].max()}")
+
+    return combined
+
+
+def fetch_in_chunks(fetcher, total_days: int, bar_size: str, use_rth: bool, chunk_days: int = 5) -> pd.DataFrame:
+    """
+    Fetch historical data in chunks using front-month contract.
+    Only works for shorter durations (< 60 days typically).
 
     Args:
         fetcher: IBKRDataFetcher instance
@@ -32,12 +180,11 @@ def fetch_in_chunks(fetcher, total_days: int, bar_size: str, use_rth: bool, chun
         bar_size: Bar size string
         use_rth: Regular trading hours only
         chunk_days: Days per chunk (default 5 for 5-min bars)
-        use_continuous: Use continuous contract for multi-year data
 
     Returns:
         Combined DataFrame
     """
-    from ib_insync import ContFuture, util
+    from ib_insync import util
 
     all_data = []
     end_date = datetime.now()
@@ -47,20 +194,9 @@ def fetch_in_chunks(fetcher, total_days: int, bar_size: str, use_rth: bool, chun
     failed_chunks = 0
     max_consecutive_fails = 10
 
-    # Use continuous contract for multi-year data
-    if use_continuous:
-        contract = ContFuture(
-            symbol=settings.SYMBOL,
-            exchange=settings.EXCHANGE,
-            currency=settings.CURRENCY,
-        )
-        logger.info(f"Using CONTINUOUS contract for {total_days} days ({total_days/365:.1f} years)")
-    else:
-        contract = fetcher._contract
-        logger.info(f"Using front-month contract for {total_days} days")
-
+    contract = fetcher._contract
+    logger.info(f"Using front-month contract for {total_days} days")
     logger.info(f"Fetching in {chunk_days}-day chunks (~{total_chunks} requests)...")
-    logger.info(f"Estimated time: {total_chunks * 3 / 60:.1f} minutes\n")
 
     consecutive_fails = 0
 
@@ -88,45 +224,35 @@ def fetch_in_chunks(fetcher, total_days: int, bar_size: str, use_rth: bool, chun
                 print(f"\r[{chunk_num}/{total_chunks}] {progress:.1f}% - {end_date.strftime('%Y-%m-%d')}: {len(df_chunk)} bars", flush=True)
                 consecutive_fails = 0
             else:
-                print(f"\r[{chunk_num}/{total_chunks}] {progress:.1f}% - {end_date.strftime('%Y-%m-%d')}: No data (may be weekend/holiday)", flush=True)
+                print(f"\r[{chunk_num}/{total_chunks}] {progress:.1f}% - {end_date.strftime('%Y-%m-%d')}: No data", flush=True)
                 consecutive_fails += 1
 
-            # Move to next chunk
             end_date = end_date - timedelta(days=chunk_days)
             days_fetched += chunk_days
-
-            # Pace the requests to avoid IBKR limits (10 sec rule)
             time.sleep(2.5)
 
         except Exception as e:
             failed_chunks += 1
             consecutive_fails += 1
-            print(f"\r[{chunk_num}/{total_chunks}] {progress:.1f}% - {end_date.strftime('%Y-%m-%d')}: Error - {str(e)[:50]}", flush=True)
-
-            # Move on even if one chunk fails
+            print(f"\r[{chunk_num}/{total_chunks}] {progress:.1f}% - {end_date.strftime('%Y-%m-%d')}: Error", flush=True)
             end_date = end_date - timedelta(days=chunk_days)
             days_fetched += chunk_days
             time.sleep(5)
 
-        # Stop if too many consecutive failures (likely hit data limit)
         if consecutive_fails >= max_consecutive_fails:
-            logger.warning(f"\n{max_consecutive_fails} consecutive failures - stopping early (may have reached data limit)")
+            logger.warning(f"\n{max_consecutive_fails} consecutive failures - stopping")
             break
 
-    print()  # New line after progress
+    print()
 
     if not all_data:
         return pd.DataFrame()
 
-    # Combine all chunks
     combined = pd.concat(all_data, ignore_index=True)
     combined = combined.drop_duplicates(subset=['date'])
     combined = combined.sort_values('date')
 
-    logger.info(f"Total: {len(combined)} bars fetched ({failed_chunks} failed chunks)")
-    if len(combined) > 0:
-        logger.info(f"Date range: {combined['date'].min()} to {combined['date'].max()}")
-
+    logger.info(f"Total: {len(combined)} bars fetched")
     return combined
 
 
@@ -207,24 +333,33 @@ def main():
                 fetcher.get_mnq_contract(expiry=args.expiry)
                 logger.info(f"Updating existing file: {args.update}")
                 df = fetcher.update_data(args.update)
+            elif total_days > 90:
+                # Multi-year data - iterate through individual contract expiries
+                years = max(1, total_days // 365)
+                logger.info(f"Fetching {years} years of data via individual contracts...")
+
+                df = fetch_by_contract_expiries(
+                    fetcher=fetcher,
+                    years=years,
+                    bar_size=args.bar_size,
+                    use_rth=args.rth_only,
+                )
+
+                # Process the raw data
+                if not df.empty:
+                    df = fetcher._process_bar_data(df)
+
             elif total_days > 30:
-                # Use chunked fetching for any duration > 30 days
-                # Use continuous contract for multi-year data (> 90 days)
-                use_continuous = total_days > 90
-
-                if not use_continuous:
-                    fetcher.get_mnq_contract(expiry=args.expiry)
-
-                logger.info(f"Using chunked fetching for {total_days} days ({total_days/365:.1f} years)...")
+                # Medium duration - use chunked fetching with front-month
+                fetcher.get_mnq_contract(expiry=args.expiry)
+                logger.info(f"Using chunked fetching for {total_days} days...")
                 df = fetch_in_chunks(
                     fetcher=fetcher,
                     total_days=total_days,
                     bar_size=args.bar_size,
                     use_rth=args.rth_only,
-                    chunk_days=5,  # 5 days per chunk for 5-min bars
-                    use_continuous=use_continuous,
+                    chunk_days=5,
                 )
-                # Process the raw data
                 if not df.empty:
                     df = fetcher._process_bar_data(df)
             else:
