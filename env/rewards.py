@@ -473,12 +473,13 @@ class RewardCalculator:
                 efficiency_reward = -0.2
 
         # === COMBINE WITH WEIGHTS ===
+        # Profit is king, but drawdown penalties are severe when triggered
         total_reward = (
-            profit_reward * 0.35 +      # Profit: 35%
-            win_rate_reward * 0.20 +    # Win rate: 20%
-            drawdown_penalty * 0.25 +   # Drawdown: 25% (INCREASED - prevent large drawdowns)
+            profit_reward * 0.45 +      # Profit: 45% (PRIMARY GOAL)
+            drawdown_penalty * 0.25 +   # Drawdown: 25% (severe penalties keep this impactful)
+            win_rate_reward * 0.15 +    # Win rate: 15%
             risk_reward * 0.10 +        # Risk-adjusted: 10%
-            efficiency_reward * 0.10    # Efficiency: 10%
+            efficiency_reward * 0.05    # Efficiency: 5%
         )
 
         return total_reward
