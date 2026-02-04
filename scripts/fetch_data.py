@@ -26,6 +26,7 @@ def fetch_continuous_all_at_once(fetcher, years: int, bar_size: str, use_rth: bo
     """
     Fetch multi-year data using continuous contract in one request.
     IBKR continuous contracts don't allow endDateTime, so we fetch everything at once.
+    Tries progressively smaller durations if large requests fail.
 
     Args:
         fetcher: IBKRDataFetcher instance
@@ -44,32 +45,41 @@ def fetch_continuous_all_at_once(fetcher, years: int, bar_size: str, use_rth: bo
         currency=settings.CURRENCY,
     )
 
-    logger.info(f"Fetching {years} years of data using CONTINUOUS contract...")
-    logger.info(f"This may take a few minutes. Please wait...")
+    # Try progressively smaller durations
+    durations_to_try = [f"{years} Y"]
+    for y in range(years - 1, 0, -1):
+        durations_to_try.append(f"{y} Y")
+    durations_to_try.extend(["6 M", "3 M", "1 M"])
 
-    try:
-        bars = fetcher.ib.reqHistoricalData(
-            contract=contract,
-            endDateTime="",  # Must be empty for ContFuture
-            durationStr=f"{years} Y",
-            barSizeSetting=bar_size,
-            whatToShow="TRADES",
-            useRTH=use_rth,
-            formatDate=1,
-            timeout=600,  # 10 minute timeout for large requests
-        )
+    for duration in durations_to_try:
+        logger.info(f"Trying to fetch {duration} of data with CONTINUOUS contract...")
+        logger.info(f"This may take several minutes. Please wait...")
 
-        if bars:
-            df = util.df(bars)
-            logger.info(f"Got {len(df)} bars")
-            return df
-        else:
-            logger.warning("No data returned from continuous contract")
-            return pd.DataFrame()
+        try:
+            bars = fetcher.ib.reqHistoricalData(
+                contract=contract,
+                endDateTime="",  # Must be empty for ContFuture
+                durationStr=duration,
+                barSizeSetting=bar_size,
+                whatToShow="TRADES",
+                useRTH=use_rth,
+                formatDate=1,
+                timeout=900,  # 15 minute timeout for large requests
+            )
 
-    except Exception as e:
-        logger.error(f"Error fetching continuous data: {e}")
-        return pd.DataFrame()
+            if bars:
+                df = util.df(bars)
+                logger.info(f"SUCCESS! Got {len(df)} bars with duration={duration}")
+                return df
+            else:
+                logger.warning(f"No data returned for {duration}")
+
+        except Exception as e:
+            logger.warning(f"Failed for {duration}: {e}")
+            time.sleep(5)
+
+    logger.error("All duration attempts failed")
+    return pd.DataFrame()
 
 
 def fetch_by_contract_expiries(fetcher, years: int, bar_size: str, use_rth: bool, chunk_days: int = 5) -> pd.DataFrame:
@@ -436,34 +446,35 @@ def main():
     try:
         with IBKRDataFetcher(paper=args.paper) as fetcher:
             if args.extend:
-                # Extend existing data by fetching older data
+                # Extend existing data - fetch max with continuous contract then combine
                 logger.info(f"Extending data file: {args.extend}")
                 existing_df = pd.read_parquet(settings.DATA_DIR / args.extend)
-                oldest_date = existing_df.index.min()
-                logger.info(f"Existing data starts at: {oldest_date}")
+                logger.info(f"Existing data: {existing_df.index.min()} to {existing_df.index.max()}")
 
-                # Fetch data ending at the oldest existing date
-                fetcher.get_mnq_contract(expiry=args.expiry)
-                df = fetch_historical_backwards(
+                # Fetch as much as possible with continuous contract
+                total_years = (total_days // 365) + 1
+                logger.info(f"Fetching {total_years} years with continuous contract...")
+
+                df = fetch_continuous_all_at_once(
                     fetcher=fetcher,
-                    end_date=oldest_date.to_pydatetime().replace(tzinfo=None),
-                    total_days=total_days,
+                    years=total_years,
                     bar_size=args.bar_size,
                     use_rth=args.rth_only,
                 )
 
                 if not df.empty:
                     df = fetcher._process_bar_data(df)
+                    logger.info(f"Fetched data: {df.index.min()} to {df.index.max()}")
 
-                    # Combine with existing
+                    # Combine - new data + existing, keep existing where overlap
                     logger.info("Combining with existing data...")
                     combined = pd.concat([df, existing_df])
                     combined = combined[~combined.index.duplicated(keep='last')]
                     combined = combined.sort_index()
                     df = combined
-                    logger.info(f"Combined data: {len(df)} rows, {df.index.min()} to {df.index.max()}")
+                    logger.info(f"Combined: {len(df)} rows, {df.index.min()} to {df.index.max()}")
                 else:
-                    logger.error("No older data fetched")
+                    logger.error("No data fetched from continuous contract")
                     return 1
 
             elif args.update:
