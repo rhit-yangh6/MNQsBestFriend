@@ -195,6 +195,16 @@ def main():
     print("=" * 60 + "\n")
 
     if args.mode == "live":
+        # Check safety gate
+        import os
+        allow_live = os.environ.get("ALLOW_LIVE_TRADING", "false").lower() == "true"
+        if not allow_live:
+            print("*" * 60)
+            print("ERROR: Live trading is disabled!")
+            print("Set ALLOW_LIVE_TRADING=true in .env to enable.")
+            print("*" * 60)
+            return 1
+
         print("*" * 60)
         print("WARNING: LIVE TRADING MODE - REAL MONEY AT RISK!")
         print("*" * 60)
