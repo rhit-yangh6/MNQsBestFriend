@@ -28,6 +28,8 @@ logger = setup_logger("trade", level="INFO")
 
 def load_model_and_config(model_dir: Path):
     """Load trained model and its configuration."""
+    import json
+
     # Load feature columns
     with open(model_dir / "feature_columns.txt", "r") as f:
         feature_columns = [line.strip() for line in f.readlines()]
@@ -36,7 +38,18 @@ def load_model_and_config(model_dir: Path):
     preprocessor = DataPreprocessor()
     preprocessor.load_scaler(model_dir / "scaler.joblib")
 
-    return feature_columns, preprocessor
+    # Load training config
+    config_path = model_dir / "training_config.json"
+    if config_path.exists():
+        with open(config_path, "r") as f:
+            training_config = json.load(f)
+    else:
+        training_config = {
+            "sl_options": [80.0, 120.0, 160.0, 200.0],
+            "lookback_window": settings.LOOKBACK_WINDOW,
+        }
+
+    return feature_columns, preprocessor, training_config
 
 
 class TradingManager:
@@ -191,8 +204,10 @@ def main():
             return 1
 
     # Load model configuration
-    feature_columns, preprocessor = load_model_and_config(model_path)
+    feature_columns, preprocessor, training_config = load_model_and_config(model_path)
+    sl_options = training_config.get("sl_options", [80.0, 120.0, 160.0, 200.0])
     logger.info(f"Using {len(feature_columns)} features")
+    logger.info(f"SL options: {sl_options}")
 
     # Load model
     logger.info("Loading model...")
@@ -211,6 +226,7 @@ def main():
     dummy_env = TradingEnv(
         df=dummy_df,
         feature_columns=feature_columns,
+        sl_options=sl_options,
     )
 
     agent = TradingAgent(algorithm="PPO")
@@ -222,16 +238,25 @@ def main():
         trader = PaperTrader(
             model=agent,
             feature_columns=feature_columns,
+            preprocessor=preprocessor,
+            sl_options=sl_options,
             lookback_window=settings.LOOKBACK_WINDOW,
             max_position=args.max_position,
             max_daily_loss=args.max_daily_loss,
-            use_ibkr=True,
+            log_dir=str(log_dir),
+            use_live_data=True,  # Use live data for no delay
         )
 
-        # Connect to IBKR
+        # Connect to IBKR (live data, simulated trades)
         if not trader.connect_sync():
-            logger.error("Failed to connect to IBKR paper trading")
+            logger.error("Failed to connect to IBKR")
             return 1
+
+        logger.info("=" * 50)
+        logger.info("PAPER TRADING MODE - SIMULATED TRADES ONLY")
+        logger.info(f"Using LIVE data feed (no delay)")
+        logger.info(f"Trades logged to: {log_dir}")
+        logger.info("=" * 50)
 
     elif args.mode == "live":
         trader = LiveTrader(

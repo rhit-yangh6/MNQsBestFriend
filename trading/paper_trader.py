@@ -1,21 +1,24 @@
 """Paper trading execution module."""
 
 import asyncio
-from datetime import datetime, time
+from datetime import datetime, time, date
 from typing import Dict, Optional, Any, Callable, List
 import logging
 import numpy as np
 import pandas as pd
+from pathlib import Path
 from threading import Thread, Event
 from queue import Queue
+import csv
 
-from ib_insync import IB, Future, util, Ticker
+from ib_insync import IB, Future, util, Ticker, BarData
 from ib_insync.contract import Contract
 
 from config.settings import settings
 from config.ib_config import ib_config
 from .order_manager import OrderManager, Order, OrderSide, OrderType, OrderStatus
 from env.position_sizer import PositionSizer
+from data.features import FeatureEngineer
 
 logger = logging.getLogger(__name__)
 
@@ -24,17 +27,21 @@ class PaperTrader:
     """
     Paper trading execution system.
 
-    Connects to IBKR paper trading account for realistic simulation.
+    Connects to IBKR live data but simulates trades in memory.
+    Logs all trades to daily CSV files.
     """
 
     def __init__(
         self,
         model,
         feature_columns: List[str],
+        preprocessor=None,
+        sl_options: List[float] = None,
         lookback_window: int = 50,
         max_position: int = 1,
         max_daily_loss: float = 500.0,
-        use_ibkr: bool = True,
+        log_dir: str = "logs/paper_trading",
+        use_live_data: bool = True,  # Connect to live for real-time data
     ):
         """
         Initialize paper trader.
@@ -42,37 +49,59 @@ class PaperTrader:
         Args:
             model: Trained trading model
             feature_columns: Feature columns for model input
+            preprocessor: Data preprocessor with fitted scaler
+            sl_options: SL options in ticks (for learnable SL)
             lookback_window: Lookback window for state
             max_position: Maximum position size
             max_daily_loss: Maximum daily loss limit
-            use_ibkr: Whether to use IBKR connection
+            log_dir: Directory for trade logs
+            use_live_data: Connect to live port for real-time data (no delay)
         """
         self.model = model
         self.feature_columns = feature_columns
+        self.preprocessor = preprocessor
+        self.sl_options = sl_options or [80.0, 120.0, 160.0, 200.0]
         self.lookback_window = lookback_window
         self.max_position = max_position
         self.max_daily_loss = max_daily_loss
-        self.use_ibkr = use_ibkr
+        self.use_live_data = use_live_data
+
+        # Log directory
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
 
         # IBKR connection
         self.ib: Optional[IB] = None
         self.contract: Optional[Contract] = None
-        self.ticker: Optional[Ticker] = None
 
-        # Order management
+        # Feature engineering
+        self.feature_engineer = FeatureEngineer()
+
+        # Order management (for tracking only, no real orders)
         self.order_manager = OrderManager()
         self.position_sizer = PositionSizer(max_position=max_position)
 
         # State tracking
         self.position = 0
         self.entry_price = 0.0
+        self.entry_time: Optional[datetime] = None
+        self.current_sl_ticks = 0.0
+        self.current_sl_level = 0
+        self.stop_loss_price = 0.0
         self.daily_pnl = 0.0
         self.total_pnl = 0.0
         self.trade_count = 0
+        self.winning_trades = 0
+        self.losing_trades = 0
 
-        # Data buffer
+        # Data buffer for OHLCV bars
         self.bar_buffer: List[Dict] = []
+        self.df_buffer: Optional[pd.DataFrame] = None
         self.last_bar_time: Optional[datetime] = None
+
+        # Trade history for current day
+        self.daily_trades: List[Dict] = []
+        self.current_trade_date: Optional[date] = None
 
         # Control
         self.running = False
@@ -83,23 +112,26 @@ class PaperTrader:
         self.on_position_change: Optional[Callable[[int, float], None]] = None
 
     async def connect(self) -> bool:
-        """Connect to IBKR paper trading."""
-        if not self.use_ibkr:
-            logger.info("Running in simulation mode (no IBKR)")
-            return True
-
+        """Connect to IBKR for live data (simulated trades only)."""
         try:
             self.ib = IB()
-            port = ib_config.get_port(paper=True)
+
+            # Use live port for real-time data, but we won't place real orders
+            if self.use_live_data:
+                port = ib_config.LIVE_PORT  # 4001 - real-time data
+                logger.info("Connecting to LIVE data feed (trades will be SIMULATED)")
+            else:
+                port = ib_config.PAPER_PORT  # 4002 - delayed data
+                logger.info("Connecting to PAPER data feed (15-20 min delay)")
 
             await self.ib.connectAsync(
                 host=ib_config.HOST,
                 port=port,
-                clientId=ib_config.CLIENT_ID + 100,  # Different client ID for paper
+                clientId=ib_config.CLIENT_ID + 200,  # Unique client ID for paper trader
                 timeout=ib_config.TIMEOUT,
             )
 
-            logger.info(f"Connected to IBKR paper trading on port {port}")
+            logger.info(f"Connected to IBKR on port {port}")
 
             # Get MNQ contract
             self.contract = Future(
@@ -126,9 +158,58 @@ class PaperTrader:
 
     def disconnect(self) -> None:
         """Disconnect from IBKR."""
+        # Save any remaining trades before disconnect
+        self._save_daily_trades()
+
         if self.ib and self.ib.isConnected():
             self.ib.disconnect()
             logger.info("Disconnected from IBKR")
+
+    def _get_csv_path(self, trade_date: date) -> Path:
+        """Get CSV file path for a given date."""
+        return self.log_dir / f"trades_{trade_date.strftime('%Y%m%d')}.csv"
+
+    def _save_daily_trades(self) -> None:
+        """Save daily trades to CSV."""
+        if not self.daily_trades:
+            return
+
+        trade_date = self.current_trade_date or date.today()
+        csv_path = self._get_csv_path(trade_date)
+
+        # Check if file exists to determine if we need headers
+        file_exists = csv_path.exists()
+
+        with open(csv_path, 'a', newline='') as f:
+            fieldnames = [
+                'timestamp', 'action', 'side', 'entry_price', 'exit_price',
+                'sl_level', 'sl_ticks', 'stop_loss_price', 'pnl', 'commission',
+                'duration_bars', 'reason', 'position_after', 'daily_pnl', 'total_pnl'
+            ]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+
+            if not file_exists:
+                writer.writeheader()
+
+            for trade in self.daily_trades:
+                writer.writerow(trade)
+
+        logger.info(f"Saved {len(self.daily_trades)} trades to {csv_path}")
+        self.daily_trades = []
+
+    def _log_trade(self, trade_data: Dict) -> None:
+        """Log a trade to the daily buffer."""
+        # Check if day changed
+        today = date.today()
+        if self.current_trade_date and self.current_trade_date != today:
+            # Save previous day's trades
+            self._save_daily_trades()
+
+        self.current_trade_date = today
+        self.daily_trades.append(trade_data)
+
+        # Also save immediately for safety
+        self._save_daily_trades()
 
     def start(self) -> None:
         """Start paper trading loop."""
@@ -152,53 +233,83 @@ class PaperTrader:
         logger.info("Paper trader stopped")
 
     def _start_ibkr_trading(self) -> None:
-        """Start IBKR-based paper trading."""
-        # Subscribe to real-time bars
-        self.ib.reqRealTimeBars(
+        """Start IBKR-based paper trading with 5-min bars."""
+        # Request historical bars first to fill buffer
+        logger.info("Fetching historical bars to fill buffer...")
+        bars = self.ib.reqHistoricalData(
             contract=self.contract,
-            barSize=5,
-            whatToShow="TRADES",
+            endDateTime='',
+            durationStr='1 D',
+            barSizeSetting='5 mins',
+            whatToShow='TRADES',
             useRTH=False,
+            formatDate=1,
+            keepUpToDate=True,  # Keep updating with new bars
         )
 
-        # Set up bar handler
-        self.ib.pendingTickersEvent += self._on_bar_update
+        # Process historical bars
+        for bar in bars:
+            self._process_bar(bar)
 
-        logger.info("Started real-time bar subscription")
+        logger.info(f"Loaded {len(bars)} historical bars")
 
-    def _on_bar_update(self, tickers: List[Ticker]) -> None:
+        # Set up handler for new bars
+        self.ib.barUpdateEvent += self._on_bar_update
+
+        logger.info("Started 5-min bar subscription")
+
+    def _on_bar_update(self, bars: List[BarData], hasNewBar: bool) -> None:
         """Handle new bar data from IBKR."""
-        for ticker in tickers:
-            if ticker.contract == self.contract:
-                self._process_bar(ticker)
+        if hasNewBar and bars:
+            # Process the latest bar
+            self._process_bar(bars[-1])
 
-    def _process_bar(self, ticker: Ticker) -> None:
-        """Process a new bar and potentially trade."""
+    def _process_bar(self, bar: BarData) -> None:
+        """Process a new 5-min bar and potentially trade."""
         # Build bar data
         bar_data = {
-            "timestamp": datetime.now(),
-            "open": ticker.open,
-            "high": ticker.high,
-            "low": ticker.low,
-            "close": ticker.close,
-            "volume": ticker.volume,
+            "timestamp": bar.date,
+            "open": bar.open,
+            "high": bar.high,
+            "low": bar.low,
+            "close": bar.close,
+            "volume": bar.volume,
         }
+
+        # Skip if same bar
+        if self.last_bar_time and bar.date <= self.last_bar_time:
+            return
+
+        self.last_bar_time = bar.date
 
         # Add to buffer
         self.bar_buffer.append(bar_data)
 
-        # Keep buffer at lookback window size
-        if len(self.bar_buffer) > self.lookback_window + 10:
-            self.bar_buffer = self.bar_buffer[-self.lookback_window - 5:]
+        # Keep buffer at reasonable size
+        max_buffer = self.lookback_window + 100
+        if len(self.bar_buffer) > max_buffer:
+            self.bar_buffer = self.bar_buffer[-max_buffer:]
+
+        # Rebuild DataFrame with features
+        self._update_feature_buffer()
 
         # Check if we have enough data
-        if len(self.bar_buffer) < self.lookback_window:
+        if self.df_buffer is None or len(self.df_buffer) < self.lookback_window:
+            logger.debug(f"Buffering data: {len(self.bar_buffer)}/{self.lookback_window} bars")
             return
+
+        current_price = bar.close
+
+        # Check SL first
+        if self.position != 0:
+            if self._check_stop_loss(current_price):
+                return  # Position was closed by SL
 
         # Check daily loss limit
         if self.daily_pnl <= -self.max_daily_loss:
             if self.position != 0:
-                self._close_position("Daily loss limit reached")
+                self._close_position(current_price, "Daily loss limit reached")
+            logger.warning(f"Daily loss limit reached: ${self.daily_pnl:.2f}")
             return
 
         # Check market hours
@@ -206,114 +317,209 @@ class PaperTrader:
             return
 
         # Get trading decision
-        action = self._get_model_action()
+        action_type, sl_level = self._get_model_action()
 
         # Execute action
-        self._execute_action(action, ticker.close)
+        self._execute_action(action_type, sl_level, current_price)
 
-    def _get_model_action(self) -> int:
-        """Get action from trained model."""
+    def _update_feature_buffer(self) -> None:
+        """Update the feature DataFrame from bar buffer."""
+        if len(self.bar_buffer) < 20:  # Need minimum bars for features
+            return
+
+        try:
+            # Create DataFrame from buffer
+            df = pd.DataFrame(self.bar_buffer)
+
+            # Compute features
+            df = self.feature_engineer.compute_all_features(df)
+
+            # Normalize features if preprocessor available
+            if self.preprocessor is not None:
+                available_features = [f for f in self.feature_columns if f in df.columns]
+                if available_features:
+                    df[available_features] = self.preprocessor.transform(df[available_features])
+
+            self.df_buffer = df
+
+        except Exception as e:
+            logger.error(f"Error computing features: {e}")
+
+    def _get_model_action(self) -> tuple:
+        """Get action from trained model (MultiDiscrete: action_type, sl_level)."""
         # Prepare observation
         obs = self._prepare_observation()
 
         # Get model prediction
         action, _ = self.model.predict(obs, deterministic=True)
 
-        return int(action)
+        # Parse MultiDiscrete action
+        if isinstance(action, np.ndarray) and len(action) >= 2:
+            action_type = int(action[0])
+            sl_level = int(action[1])
+        else:
+            action_type = int(action[0]) if isinstance(action, np.ndarray) else int(action)
+            sl_level = 1  # Default medium
+
+        return action_type, sl_level
 
     def _prepare_observation(self) -> Dict[str, np.ndarray]:
-        """Prepare observation for model input."""
-        # Convert buffer to DataFrame
-        df = pd.DataFrame(self.bar_buffer[-self.lookback_window:])
+        """Prepare observation for model input (7-element position_info)."""
+        # Build DataFrame from buffer
+        if self.df_buffer is None or len(self.df_buffer) < self.lookback_window:
+            # Not enough data yet, return zeros
+            market_features = np.zeros((self.lookback_window, len(self.feature_columns)), dtype=np.float32)
+            position_info = np.zeros(7, dtype=np.float32)
+            return {"market_features": market_features, "position_info": position_info}
 
-        # Get features (assuming features are pre-computed or we compute them)
-        # For simplicity, using available columns
-        market_features = df[["open", "high", "low", "close", "volume"]].values
+        # Get last lookback_window rows
+        df = self.df_buffer.iloc[-self.lookback_window:].copy()
 
-        # Normalize position info
+        # Get feature columns
+        available_features = [f for f in self.feature_columns if f in df.columns]
+        market_features = df[available_features].values.astype(np.float32)
+
+        # Calculate position info (7 elements)
+        unrealized_pnl = self._calculate_unrealized_pnl()
+        time_in_position = 0
+        if self.entry_time:
+            time_in_position = len(self.bar_buffer) - self.bar_buffer.index(
+                next((b for b in self.bar_buffer if b.get('timestamp') == self.entry_time), self.bar_buffer[0])
+            )
+
+        # Balance ratio (assuming $10k initial)
+        initial_balance = 10000.0
+        current_equity = initial_balance + self.total_pnl + unrealized_pnl
+        balance_ratio = current_equity / initial_balance
+
+        # SL distance ratio
+        if self.position != 0 and self.current_sl_ticks > 0:
+            sl_points = self.current_sl_ticks * settings.TICK_SIZE
+            max_loss = sl_points * settings.POINT_VALUE
+            pnl_to_sl_ratio = (unrealized_pnl + max_loss) / max_loss if max_loss > 0 else 1.0
+        else:
+            pnl_to_sl_ratio = 1.0
+
+        # Max P&L ratio (simplified - would need tracking)
+        max_pnl_ratio = 1.0
+
+        # Normalized SL level
+        sl_level_norm = self.current_sl_level / max(1, len(self.sl_options) - 1) if self.position != 0 else 0.5
+
         position_info = np.array([
-            np.sign(self.position),
-            self._calculate_unrealized_pnl() / 1000,  # Normalized
-            0.0,  # Time in position (simplified)
-            1.0,  # Balance ratio (simplified)
+            self.position,
+            unrealized_pnl / initial_balance,
+            min(time_in_position / 100, 1.0),
+            balance_ratio,
+            pnl_to_sl_ratio,
+            max_pnl_ratio,
+            sl_level_norm,
         ], dtype=np.float32)
 
         return {
-            "market_features": market_features.astype(np.float32),
+            "market_features": market_features,
             "position_info": position_info,
         }
 
-    def _execute_action(self, action: int, current_price: float) -> None:
+    def _execute_action(self, action_type: int, sl_level: int, current_price: float) -> None:
         """
-        Execute trading action.
+        Execute trading action (SIMULATED - no real orders).
 
         Args:
-            action: 0=HOLD, 1=BUY, 2=SELL, 3=CLOSE
+            action_type: 0=HOLD, 1=BUY, 2=SELL, 3=CLOSE
+            sl_level: SL level index
             current_price: Current market price
         """
-        if action == 0:  # HOLD
+        if action_type == 0:  # HOLD
+            # Check if SL hit while holding
+            if self.position != 0:
+                self._check_stop_loss(current_price)
             return
 
-        elif action == 1:  # BUY
+        elif action_type == 1:  # BUY
             if self.position == -1:
-                self._close_position("Signal reversal")
+                self._close_position(current_price, "Signal reversal")
             if self.position <= 0:
-                self._open_position(OrderSide.BUY, current_price)
+                self._open_position(OrderSide.BUY, current_price, sl_level)
 
-        elif action == 2:  # SELL
+        elif action_type == 2:  # SELL
             if self.position == 1:
-                self._close_position("Signal reversal")
+                self._close_position(current_price, "Signal reversal")
             if self.position >= 0:
-                self._open_position(OrderSide.SELL, current_price)
+                self._open_position(OrderSide.SELL, current_price, sl_level)
 
-        elif action == 3:  # CLOSE
+        elif action_type == 3:  # CLOSE
             if self.position != 0:
-                self._close_position("Model signal")
+                self._close_position(current_price, "Model signal")
 
-    def _open_position(self, side: OrderSide, price: float) -> None:
-        """Open a new position."""
+    def _check_stop_loss(self, current_price: float) -> bool:
+        """Check if stop loss is hit. Returns True if position was closed."""
+        if self.position == 0 or self.stop_loss_price == 0:
+            return False
+
+        if self.position == 1:  # Long
+            if current_price <= self.stop_loss_price:
+                self._close_position(self.stop_loss_price, "STOP_LOSS")
+                return True
+        else:  # Short
+            if current_price >= self.stop_loss_price:
+                self._close_position(self.stop_loss_price, "STOP_LOSS")
+                return True
+
+        return False
+
+    def _open_position(self, side: OrderSide, price: float, sl_level: int) -> None:
+        """Open a new position (SIMULATED)."""
         try:
-            # Create order
-            order = self.order_manager.create_order(
-                symbol=settings.SYMBOL,
-                side=side,
-                quantity=1,
-                order_type=OrderType.MARKET,
-            )
+            # Simulate fill with slippage
+            slippage = settings.SLIPPAGE_TICKS * settings.TICK_SIZE
+            fill_price = price + slippage if side == OrderSide.BUY else price - slippage
 
-            if self.use_ibkr and self.ib:
-                # Submit to IBKR
-                ib_order = self._create_ib_order(side, 1)
-                trade = self.ib.placeOrder(self.contract, ib_order)
-                self.order_manager.submit_order(order)
+            # Set SL based on chosen level
+            sl_level = min(sl_level, len(self.sl_options) - 1)
+            self.current_sl_level = sl_level
+            self.current_sl_ticks = self.sl_options[sl_level]
+            sl_points = self.current_sl_ticks * settings.TICK_SIZE
 
-                # Wait for fill (simplified)
-                self.ib.sleep(1)
-
-                if trade.orderStatus.status == "Filled":
-                    fill_price = trade.orderStatus.avgFillPrice
-                    self.order_manager.fill_order(
-                        order.order_id,
-                        fill_price,
-                        commission=settings.COMMISSION_PER_CONTRACT,
-                    )
+            # Calculate stop loss price
+            if side == OrderSide.BUY:
+                self.stop_loss_price = fill_price - sl_points
             else:
-                # Simulate fill
-                slippage = settings.SLIPPAGE_TICKS * settings.TICK_SIZE
-                fill_price = price + slippage if side == OrderSide.BUY else price - slippage
-                self.order_manager.fill_order(
-                    order.order_id,
-                    fill_price,
-                    commission=settings.COMMISSION_PER_CONTRACT,
-                )
+                self.stop_loss_price = fill_price + sl_points
 
             # Update position state
             self.position = 1 if side == OrderSide.BUY else -1
-            self.entry_price = order.filled_price
+            self.entry_price = fill_price
+            self.entry_time = datetime.now()
             self.trade_count += 1
 
+            # Deduct commission
+            self.daily_pnl -= settings.COMMISSION_PER_CONTRACT
+            self.total_pnl -= settings.COMMISSION_PER_CONTRACT
+
+            # Log trade
+            trade_data = {
+                'timestamp': datetime.now().isoformat(),
+                'action': 'OPEN',
+                'side': side.value,
+                'entry_price': fill_price,
+                'exit_price': None,
+                'sl_level': sl_level,
+                'sl_ticks': self.current_sl_ticks,
+                'stop_loss_price': self.stop_loss_price,
+                'pnl': None,
+                'commission': settings.COMMISSION_PER_CONTRACT,
+                'duration_bars': None,
+                'reason': 'Model signal',
+                'position_after': self.position,
+                'daily_pnl': self.daily_pnl,
+                'total_pnl': self.total_pnl,
+            }
+            self._log_trade(trade_data)
+
             logger.info(
-                f"Opened {side.value} position at {order.filled_price:.2f}"
+                f"[SIM] Opened {side.value} at {fill_price:.2f}, "
+                f"SL={self.stop_loss_price:.2f} (level {sl_level}, {self.current_sl_ticks} ticks)"
             )
 
             if self.on_position_change:
@@ -322,66 +528,79 @@ class PaperTrader:
         except Exception as e:
             logger.error(f"Error opening position: {e}")
 
-    def _close_position(self, reason: str) -> None:
-        """Close current position."""
+    def _close_position(self, exit_price: float, reason: str) -> None:
+        """Close current position (SIMULATED)."""
         if self.position == 0:
             return
 
         try:
-            side = OrderSide.SELL if self.position > 0 else OrderSide.BUY
-
-            order = self.order_manager.create_order(
-                symbol=settings.SYMBOL,
-                side=side,
-                quantity=1,
-                order_type=OrderType.MARKET,
-            )
-
-            if self.use_ibkr and self.ib:
-                ib_order = self._create_ib_order(side, 1)
-                trade = self.ib.placeOrder(self.contract, ib_order)
-                self.order_manager.submit_order(order)
-                self.ib.sleep(1)
-
-                if trade.orderStatus.status == "Filled":
-                    fill_price = trade.orderStatus.avgFillPrice
-                    self.order_manager.fill_order(
-                        order.order_id,
-                        fill_price,
-                        commission=settings.COMMISSION_PER_CONTRACT,
-                    )
-            else:
-                # Simulate fill
-                current_price = self.bar_buffer[-1]["close"] if self.bar_buffer else self.entry_price
-                slippage = settings.SLIPPAGE_TICKS * settings.TICK_SIZE
-                fill_price = current_price - slippage if side == OrderSide.SELL else current_price + slippage
-                self.order_manager.fill_order(
-                    order.order_id,
-                    fill_price,
-                    commission=settings.COMMISSION_PER_CONTRACT,
-                )
+            # Simulate fill with slippage
+            slippage = settings.SLIPPAGE_TICKS * settings.TICK_SIZE
+            if self.position > 0:  # Closing long
+                fill_price = exit_price - slippage
+            else:  # Closing short
+                fill_price = exit_price + slippage
 
             # Calculate P&L
-            price_diff = order.filled_price - self.entry_price
+            price_diff = fill_price - self.entry_price
             pnl = price_diff * self.position * settings.POINT_VALUE
-            pnl -= settings.COMMISSION_PER_CONTRACT * 2  # Round trip
+            pnl -= settings.COMMISSION_PER_CONTRACT  # Exit commission
 
             self.daily_pnl += pnl
             self.total_pnl += pnl
 
+            # Track win/loss
+            if pnl > 0:
+                self.winning_trades += 1
+            else:
+                self.losing_trades += 1
+
+            # Calculate duration
+            duration_bars = 0
+            if self.entry_time:
+                # Approximate duration based on bars in buffer since entry
+                duration_bars = len([b for b in self.bar_buffer
+                                    if b.get('timestamp', datetime.min) >= self.entry_time])
+
+            # Log trade
+            trade_data = {
+                'timestamp': datetime.now().isoformat(),
+                'action': 'CLOSE',
+                'side': 'LONG' if self.position > 0 else 'SHORT',
+                'entry_price': self.entry_price,
+                'exit_price': fill_price,
+                'sl_level': self.current_sl_level,
+                'sl_ticks': self.current_sl_ticks,
+                'stop_loss_price': self.stop_loss_price,
+                'pnl': pnl,
+                'commission': settings.COMMISSION_PER_CONTRACT * 2,
+                'duration_bars': duration_bars,
+                'reason': reason,
+                'position_after': 0,
+                'daily_pnl': self.daily_pnl,
+                'total_pnl': self.total_pnl,
+            }
+            self._log_trade(trade_data)
+
             logger.info(
-                f"Closed position at {order.filled_price:.2f}, "
+                f"[SIM] Closed {'LONG' if self.position > 0 else 'SHORT'} at {fill_price:.2f}, "
                 f"P&L: ${pnl:.2f}, Reason: {reason}"
             )
 
             # Reset position state
+            prev_position = self.position
             self.position = 0
             self.entry_price = 0.0
+            self.entry_time = None
+            self.stop_loss_price = 0.0
+            self.current_sl_ticks = 0.0
+            self.current_sl_level = 0
 
             # Callback
             if self.on_trade:
                 self.on_trade({
-                    "exit_price": order.filled_price,
+                    "entry_price": self.entry_price,
+                    "exit_price": fill_price,
                     "pnl": pnl,
                     "reason": reason,
                 })
