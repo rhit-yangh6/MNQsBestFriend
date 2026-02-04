@@ -336,12 +336,20 @@ class LiveTrader:
         if not self.trading_enabled:
             return
 
+        # Check weekend close first - no holding over weekend
+        if self._check_weekend_close():
+            return
+
         # Check daily loss limit
         if self._check_daily_loss_limit():
             return
 
         # Check market hours
         if not self._is_trading_hours():
+            return
+
+        # Don't open new positions near weekend close
+        if self._is_weekend_close_time():
             return
 
         # Get model action
@@ -606,6 +614,26 @@ class LiveTrader:
         rth_end = time(settings.RTH_END[0], settings.RTH_END[1])
 
         return rth_start <= current_time <= rth_end
+
+    def _is_weekend_close_time(self) -> bool:
+        """Check if it's time to close positions for the weekend."""
+        now = datetime.now()
+        # Check if it's Friday (weekday 4)
+        if now.weekday() != settings.WEEKEND_CLOSE_DAY:
+            return False
+
+        # Check if past weekend close time
+        close_time = time(settings.WEEKEND_CLOSE_TIME[0], settings.WEEKEND_CLOSE_TIME[1])
+        return now.time() >= close_time
+
+    def _check_weekend_close(self) -> bool:
+        """Close position if it's weekend close time. Returns True if closed."""
+        if self.position != 0 and self._is_weekend_close_time():
+            self._close_position("WEEKEND_CLOSE")
+            logger.info("Closed position for weekend - no holding over weekend")
+            self._send_alert("INFO", "Closed position for weekend")
+            return True
+        return False
 
     def _start_monitoring(self) -> None:
         """Start background monitoring thread."""

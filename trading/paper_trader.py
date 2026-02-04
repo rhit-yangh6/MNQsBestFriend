@@ -357,7 +357,11 @@ class PaperTrader:
 
         current_price = bar.close
 
-        # Check SL first
+        # Check weekend close first - no holding over weekend
+        if self._check_weekend_close(current_price):
+            return  # Position closed for weekend
+
+        # Check SL
         if self.position != 0:
             if self._check_stop_loss(current_price):
                 return  # Position was closed by SL
@@ -371,6 +375,10 @@ class PaperTrader:
 
         # Check market hours
         if not self._is_trading_hours():
+            return
+
+        # Don't open new positions near weekend close
+        if self._is_weekend_close_time():
             return
 
         # Get trading decision
@@ -691,6 +699,25 @@ class PaperTrader:
 
         # For now, allow trading during RTH
         return rth_start <= now <= rth_end
+
+    def _is_weekend_close_time(self) -> bool:
+        """Check if it's time to close positions for the weekend."""
+        now = datetime.now()
+        # Check if it's Friday (weekday 4)
+        if now.weekday() != settings.WEEKEND_CLOSE_DAY:
+            return False
+
+        # Check if past weekend close time
+        close_time = time(settings.WEEKEND_CLOSE_TIME[0], settings.WEEKEND_CLOSE_TIME[1])
+        return now.time() >= close_time
+
+    def _check_weekend_close(self, current_price: float) -> bool:
+        """Close position if it's weekend close time. Returns True if closed."""
+        if self.position != 0 and self._is_weekend_close_time():
+            self._close_position(current_price, "WEEKEND_CLOSE")
+            logger.info("Closed position for weekend - no holding over weekend")
+            return True
+        return False
 
     def get_status(self) -> Dict[str, Any]:
         """Get current trading status."""

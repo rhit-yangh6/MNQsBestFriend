@@ -34,6 +34,10 @@ class Settings:
     GLOBEX_START: Tuple[int, int] = (18, 0)  # 6:00 PM ET (Sunday)
     GLOBEX_END: Tuple[int, int] = (17, 0)    # 5:00 PM ET (Friday)
 
+    # Weekend close - close all positions before this time on Friday
+    WEEKEND_CLOSE_DAY: int = 4  # Friday (Monday=0)
+    WEEKEND_CLOSE_TIME: Tuple[int, int] = (16, 45)  # 4:45 PM ET Friday
+
     # Trading parameters
     MAX_POSITION_SIZE: int = 5  # Maximum contracts
     DEFAULT_POSITION_SIZE: int = 1
