@@ -43,6 +43,8 @@ class Settings:
     DEFAULT_POSITION_SIZE: int = 1
     MAX_DAILY_LOSS: float = 500.0  # Maximum daily loss in USD
     RISK_PER_TRADE: float = 0.02  # 2% risk per trade
+    MAX_DRAWDOWN: float = 0.15  # Maximum drawdown before stopping (15%)
+    DRAWDOWN_REDUCE_THRESHOLD: float = 0.08  # Reduce trading at 8% drawdown
 
     # Transaction costs
     COMMISSION_PER_CONTRACT: float = 0.62  # Per side
