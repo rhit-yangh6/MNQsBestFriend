@@ -1,0 +1,12 @@
+{
+  "algorithm": "PPO",
+  "feature_extractor": "lstm",
+  "reward_type": "composite",
+  "lookback_window": 50,
+  "sl_options": [
+    80.0,
+    120.0,
+    160.0,
+    200.0
+  ]
+}

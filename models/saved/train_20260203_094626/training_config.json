@@ -1,7 +1,0 @@
-{
-  "algorithm": "PPO",
-  "feature_extractor": "lstm",
-  "reward_type": "composite",
-  "lookback_window": 50,
-  "emergency_sl_ticks": 200.0
-}
