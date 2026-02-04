@@ -126,8 +126,8 @@ def main():
     parser.add_argument(
         "--n-envs",
         type=int,
-        default=4,
-        help="Number of parallel environments (default: 4)",
+        default=8,
+        help="Number of parallel environments (default: 8)",
     )
     parser.add_argument(
         "--batch-multiplier",
