@@ -456,8 +456,9 @@ class RewardCalculator:
         else:
             risk_reward = 0.3 if self._total_profit > 0 else 0.0
 
-        # === 5. TRADE EFFICIENCY COMPONENT (10% weight) ===
+        # === 5. TRADE EFFICIENCY COMPONENT (5% weight) ===
         if pnl > 0:
+            # Quick wins are good
             if time_in_position <= 5:
                 efficiency_reward = 0.3
             elif time_in_position <= 15:
@@ -465,21 +466,28 @@ class RewardCalculator:
             else:
                 efficiency_reward = 0.0
         else:
-            if time_in_position <= 3:
-                efficiency_reward = 0.1
+            # Losing trades - penalize very short ones (bad entry signals)
+            if time_in_position <= 1:
+                # Super fast losing trade = terrible entry, heavy penalty
+                efficiency_reward = -1.0
+            elif time_in_position <= 3:
+                # Very quick loss = bad entry
+                efficiency_reward = -0.5
             elif time_in_position <= 10:
+                # Normal loss duration
                 efficiency_reward = 0.0
             else:
-                efficiency_reward = -0.2
+                # Held too long before stopping = slow to cut losses
+                efficiency_reward = -0.3
 
         # === COMBINE WITH WEIGHTS ===
-        # Profit is king, but drawdown penalties are severe when triggered
+        # Profit first, win rate second, drawdown protection third
         total_reward = (
-            profit_reward * 0.45 +      # Profit: 45% (PRIMARY GOAL)
-            drawdown_penalty * 0.25 +   # Drawdown: 25% (severe penalties keep this impactful)
-            win_rate_reward * 0.15 +    # Win rate: 15%
+            profit_reward * 0.40 +      # Profit: 40% (PRIMARY GOAL)
+            win_rate_reward * 0.25 +    # Win rate: 25% (VERY IMPORTANT)
+            drawdown_penalty * 0.20 +   # Drawdown: 20% (severe penalties still impactful)
             risk_reward * 0.10 +        # Risk-adjusted: 10%
-            efficiency_reward * 0.05    # Efficiency: 5%
+            efficiency_reward * 0.05    # Efficiency: 5% (includes fast loss penalty)
         )
 
         return total_reward
