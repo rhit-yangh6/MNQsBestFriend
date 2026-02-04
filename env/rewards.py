@@ -377,10 +377,15 @@ class RewardCalculator:
         normalized_pnl = pnl / 50.0
         if pnl > 0:
             # Progressive bonus for larger wins
-            if normalized_pnl > 2.0:
-                profit_reward = normalized_pnl * 1.3
-            elif normalized_pnl > 1.0:
-                profit_reward = normalized_pnl * 1.15
+            if pnl >= 500:
+                # EXCEPTIONAL trade - $500+ is huge
+                profit_reward = normalized_pnl * 1.5 + 2.5
+            elif pnl >= 300:
+                # GOOD big winner - $300+ is solid
+                profit_reward = normalized_pnl * 1.3 + 1.0
+            elif pnl >= 100:
+                # Decent trade
+                profit_reward = normalized_pnl * 1.15 + 0.3
             else:
                 profit_reward = normalized_pnl
         else:
