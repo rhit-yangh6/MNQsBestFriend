@@ -486,13 +486,18 @@ class RewardCalculator:
                 efficiency_reward = -0.3
 
         # === COMBINE WITH WEIGHTS ===
-        # Profit first, win rate second, drawdown protection third
+        # REVISED WEIGHTS:
+        # Profit: 45% (Increased from 40%) - The ultimate goal
+        # Win Rate: 20% (Decreased from 25%) - Important but profit matters more
+        # Drawdown: 20% (Same) - critical for survival
+        # Risk-Adjusted: 15% (Increased from 10%) - Emphasize consistency
+        # Efficiency: 0% (Removed) - Holding time is less important than profit
+        
         total_reward = (
-            profit_reward * 0.40 +      # Profit: 40% (PRIMARY GOAL)
-            win_rate_reward * 0.25 +    # Win rate: 25% (VERY IMPORTANT)
-            drawdown_penalty * 0.20 +   # Drawdown: 20% (severe penalties still impactful)
-            risk_reward * 0.10 +        # Risk-adjusted: 10%
-            efficiency_reward * 0.05    # Efficiency: 5% (includes fast loss penalty)
+            profit_reward * 0.45 +      # Profit: 45%
+            win_rate_reward * 0.20 +    # Win rate: 20%
+            drawdown_penalty * 0.20 +   # Drawdown: 20%
+            risk_reward * 0.15          # Risk-adjusted: 15%
         )
 
         return total_reward

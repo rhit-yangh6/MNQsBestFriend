@@ -65,7 +65,7 @@ def main():
     parser.add_argument(
         "--timesteps",
         type=int,
-        default=500_000,
+        default=1_000_000,
         help="Total training timesteps",
     )
     parser.add_argument(
@@ -78,8 +78,8 @@ def main():
     parser.add_argument(
         "--feature-extractor",
         type=str,
-        default="lstm",
-        choices=["lstm", "attention"],
+        default="gru",
+        choices=["lstm", "gru", "residual_lstm", "attention"],
         help="Feature extractor type",
     )
     parser.add_argument(
@@ -91,7 +91,7 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=64,
+        default=512,
         help="Batch size",
     )
     parser.add_argument(
@@ -146,6 +146,17 @@ def main():
         type=str,
         default=None,
         help="Path to model directory to resume training from",
+    )
+    parser.add_argument(
+        "--n-steps",
+        type=int,
+        default=4096,
+        help="Steps per environment per update (PPO)",
+    )
+    parser.add_argument(
+        "--normalize",
+        action="store_true",
+        help="Use VecNormalize for input normalization",
     )
 
     args = parser.parse_args()
@@ -221,7 +232,7 @@ def main():
 
     else:
         # Standard training with parallel environments
-        from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+        from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize
         from stable_baselines3.common.monitor import Monitor
 
         def make_env(df, feature_columns, reward_type, sl_options, seed, rank):
@@ -242,15 +253,15 @@ def main():
         logger.info(f"Creating {n_envs} parallel environments...")
 
         # Create parallel training environments
-        if n_envs > 1:
-            train_envs = SubprocVecEnv([
-                make_env(train_df, feature_columns, args.reward_type, sl_options, args.seed, i)
-                for i in range(n_envs)
-            ])
-        else:
-            train_envs = DummyVecEnv([
-                make_env(train_df, feature_columns, args.reward_type, sl_options, args.seed, 0)
-            ])
+        # Default to DummyVecEnv for fewer environments or Mac
+        train_envs = DummyVecEnv([
+            make_env(train_df, feature_columns, args.reward_type, sl_options, args.seed, i)
+            for i in range(n_envs)
+        ])
+        
+        # Apply normalization if requested
+        if args.normalize:
+            train_envs = VecNormalize(train_envs, norm_obs=True, norm_reward=False, clip_obs=10.0)
 
         # Single validation environment
         val_env = TradingEnv(

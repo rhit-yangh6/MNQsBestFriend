@@ -109,6 +109,13 @@ class BacktestEngine:
         self.tick_size = tick_size
         self.max_position = max_position
 
+        # Pre-convert to numpy for speed
+        self.close_prices = df["close"].values.astype(np.float32)
+        self.high_prices = df["high"].values.astype(np.float32)
+        self.low_prices = df["low"].values.astype(np.float32)
+        self.timestamps = df.index.values
+        self.n_bars = len(df)
+
         # State
         self.capital = initial_capital
         self.position = Position()
@@ -159,31 +166,33 @@ class BacktestEngine:
             Backtest results dictionary
         """
         self.reset()
-        n_bars = len(self.df)
+        n_bars = self.n_bars
 
         logger.info(f"Starting backtest with {n_bars} bars")
 
         for i in tqdm(range(n_bars), desc="Backtesting", unit="bars"):
             self.current_bar = i
-            bar = self.df.iloc[i]
+            close = self.close_prices[i]
+            high = self.high_prices[i]
+            low = self.low_prices[i]
 
             # Update position P&L
-            self._update_position_pnl(bar["close"])
+            self._update_position_pnl(close)
 
             # Track MFE/MAE
             if self.position.quantity != 0:
-                self._track_excursion(bar)
+                self._track_excursion_fast(high, low)
 
             # Record equity
             equity = self.capital + self.position.unrealized_pnl
             self.equity_curve.append(equity)
 
-            # Get strategy signal
+            # Get strategy signal (still needs df for complex strategies)
             signal = strategy(self.df, i, self.position)
 
             # Execute signal
             if signal is not None:
-                self._execute_signal(signal, bar)
+                self._execute_signal_fast(signal, i, close)
 
             # Progress callback
             if progress_callback and i % 1000 == 0:
@@ -225,7 +234,7 @@ class BacktestEngine:
             Backtest results
         """
         self.reset()
-        n_bars = len(self.df)
+        n_bars = self.n_bars
         self._time_in_position = 0
         self._sl_options = sl_options or [80.0, 120.0, 160.0, 200.0]
         self._current_sl_ticks = 0.0
@@ -234,20 +243,25 @@ class BacktestEngine:
         self._sl_hits = 0
         self._max_unrealized_pnl = 0.0
         self._sl_choices = []
+        
+        # Pre-convert feature data to numpy
+        self._feature_data = self.df[feature_columns].values.astype(np.float32)
 
         logger.info(f"Running model backtest with {n_bars} bars")
         logger.info(f"SL options: {self._sl_options} ticks")
 
         for i in tqdm(range(lookback_window, n_bars), desc="Backtesting", unit="bars"):
             self.current_bar = i
-            bar = self.df.iloc[i]
+            close = self.close_prices[i]
+            high = self.high_prices[i]
+            low = self.low_prices[i]
 
             # Update position P&L
-            self._update_position_pnl(bar["close"])
+            self._update_position_pnl(close)
 
             # Track MFE/MAE and max unrealized P&L
             if self.position.quantity != 0:
-                self._track_excursion(bar)
+                self._track_excursion_fast(high, low)
                 self._time_in_position += 1
                 self._max_unrealized_pnl = max(self._max_unrealized_pnl, self.position.unrealized_pnl)
 
@@ -258,13 +272,13 @@ class BacktestEngine:
             # Check SL first
             sl_hit = False
             if self.position.quantity != 0:
-                sl_hit = self._check_sl(bar)
+                sl_hit = self._check_sl_fast(high, low)
 
             if sl_hit:
                 continue
 
-            # Prepare observation
-            obs = self._prepare_observation(i, feature_columns, lookback_window)
+            # Prepare observation (optimized)
+            obs = self._prepare_observation_fast(i, lookback_window)
 
             # Get model prediction (MultiDiscrete: [action_type, sl_level])
             action, _ = model.predict(obs, deterministic=deterministic)
@@ -282,7 +296,7 @@ class BacktestEngine:
                 pass
             elif action_type == 3:  # CLOSE
                 if self.position.quantity != 0:
-                    self._close_position(bar)
+                    self._close_position_fast(i, close)
                     self._time_in_position = 0
                     self._max_unrealized_pnl = 0.0
             elif action_type in [1, 2]:  # BUY or SELL
@@ -291,10 +305,10 @@ class BacktestEngine:
 
                 if (signal == OrderSide.BUY and current_pos == -1) or \
                    (signal == OrderSide.SELL and current_pos == 1):
-                    self._close_position(bar)
-                    self._open_position_with_sl(signal, bar, sl_level)
+                    self._close_position_fast(i, close)
+                    self._open_position_with_sl_fast(signal, i, close, sl_level)
                 elif current_pos == 0:
-                    self._open_position_with_sl(signal, bar, sl_level)
+                    self._open_position_with_sl_fast(signal, i, close, sl_level)
 
         # Close any open position
         if self.position.quantity != 0:
@@ -343,6 +357,24 @@ class BacktestEngine:
         else:  # Short position
             if high >= self._stop_loss_price:
                 self._close_at_price(self._stop_loss_price, bar)
+                self._sl_hits += 1
+                return True
+
+        return False
+
+    def _check_sl_fast(self, high: float, low: float) -> bool:
+        """Check if stop loss was hit (optimized). Returns True if position was closed."""
+        if self.position.quantity == 0:
+            return False
+
+        if self.position.quantity > 0:  # Long position
+            if low <= self._stop_loss_price:
+                self._close_at_price_fast(self._stop_loss_price, self.current_bar)
+                self._sl_hits += 1
+                return True
+        else:  # Short position
+            if high >= self._stop_loss_price:
+                self._close_at_price_fast(self._stop_loss_price, self.current_bar)
                 self._sl_hits += 1
                 return True
 
@@ -448,6 +480,235 @@ class BacktestEngine:
             "market_features": market_data.astype(np.float32),
             "position_info": position_info,
         }
+    
+    def _prepare_observation_fast(
+        self,
+        current_bar: int,
+        lookback_window: int,
+    ) -> Dict[str, np.ndarray]:
+        """Prepare observation for model (optimized with pre-converted data)."""
+        start_idx = current_bar - lookback_window
+        market_data = self._feature_data[start_idx:current_bar]
+
+        # Normalize unrealized P&L
+        normalized_pnl = self.position.unrealized_pnl / self.initial_capital
+
+        # Balance ratio
+        current_equity = self.capital + self.position.unrealized_pnl
+        balance_ratio = current_equity / self.initial_capital
+
+        # Calculate distance to SL and max P&L ratio
+        if self.position.quantity != 0:
+            sl_points = self._current_sl_ticks * self.tick_size
+            max_loss = sl_points * self.point_value
+            pnl_to_sl_ratio = (self.position.unrealized_pnl + max_loss) / max_loss if max_loss > 0 else 1.0
+            max_pnl_ratio = self.position.unrealized_pnl / max(1.0, self._max_unrealized_pnl) if self._max_unrealized_pnl > 0 else 1.0
+        else:
+            pnl_to_sl_ratio = 1.0
+            max_pnl_ratio = 1.0
+
+        # Normalize current SL level
+        sl_level_norm = self._current_sl_level / max(1, len(self._sl_options) - 1) if self.position.quantity != 0 else 0.5
+
+        position_info = np.array([
+            np.sign(self.position.quantity),
+            normalized_pnl,
+            min(self._time_in_position / 100, 1.0),
+            balance_ratio,
+            pnl_to_sl_ratio,
+            max_pnl_ratio,
+            sl_level_norm,
+        ], dtype=np.float32)
+
+        return {
+            "market_features": market_data,
+            "position_info": position_info,
+        }
+
+    def _execute_signal_fast(self, signal: OrderSide, bar_idx: int, close: float) -> None:
+        """Execute a trading signal (optimized)."""
+        current_position = np.sign(self.position.quantity)
+        timestamp = self.timestamps[bar_idx]
+
+        if signal == OrderSide.BUY:
+            if current_position == -1:
+                # Close short first
+                self._close_position_fast(bar_idx, close)
+            if current_position <= 0:
+                # Open long
+                self._open_position_fast(OrderSide.BUY, bar_idx, close, timestamp)
+
+        elif signal == OrderSide.SELL:
+            if current_position == 1:
+                # Close long first
+                self._close_position_fast(bar_idx, close)
+            if current_position >= 0:
+                # Open short
+                self._open_position_fast(OrderSide.SELL, bar_idx, close, timestamp)
+
+    def _open_position_with_sl_fast(self, side: OrderSide, bar_idx: int, close: float, sl_level: int = 0) -> None:
+        """Open position and set stop loss based on chosen level (optimized)."""
+        timestamp = self.timestamps[bar_idx]
+        self._open_position_fast(side, bar_idx, close, timestamp)
+
+        # Set SL based on chosen level
+        sl_level = min(sl_level, len(self._sl_options) - 1)
+        self._current_sl_level = sl_level
+        self._current_sl_ticks = self._sl_options[sl_level]
+        sl_points = self._current_sl_ticks * self.tick_size
+
+        # Track SL choice
+        self._sl_choices.append(sl_level)
+
+        if side == OrderSide.BUY:
+            self._stop_loss_price = self.position.entry_price - sl_points
+        else:
+            self._stop_loss_price = self.position.entry_price + sl_points
+
+        self._time_in_position = 0
+        self._max_unrealized_pnl = 0.0
+
+    def _open_position_fast(
+        self, side: OrderSide, bar_idx: int, close: float, timestamp: datetime
+    ) -> None:
+        """Open a new position (optimized)."""
+        # Calculate fill price with slippage
+        if side == OrderSide.BUY:
+            fill_price = close + self.slippage
+        else:
+            fill_price = close - self.slippage
+
+        # Deduct commission
+        self.capital -= self.commission
+
+        # Update position
+        self.position.quantity = int(side)
+        self.position.entry_price = fill_price
+        self.position.entry_time = timestamp
+
+        # Reset MFE/MAE tracking
+        self._trade_high = fill_price
+        self._trade_low = fill_price
+
+        logger.debug(
+            f"Opened {'LONG' if side == OrderSide.BUY else 'SHORT'} "
+            f"at {fill_price:.2f}"
+        )
+
+    def _close_position_fast(self, bar_idx: int, close: float) -> None:
+        """Close current position (optimized)."""
+        if self.position.quantity == 0:
+            return
+
+        timestamp = self.timestamps[bar_idx]
+
+        # Calculate fill price with slippage
+        if self.position.quantity > 0:  # Closing long
+            fill_price = close - self.slippage
+        else:  # Closing short
+            fill_price = close + self.slippage
+
+        # Calculate P&L
+        price_diff = fill_price - self.position.entry_price
+        pnl = price_diff * self.position.quantity * self.point_value
+        pnl -= self.commission  # Exit commission
+
+        # Update capital
+        self.capital += pnl
+        self.position.realized_pnl += pnl
+
+        # Calculate duration
+        if self.position.entry_time is not None:
+            # Use numpy searchsorted for fast index lookup
+            entry_idx = np.searchsorted(self.timestamps, self.position.entry_time)
+            duration = self.current_bar - entry_idx
+        else:
+            duration = 0
+
+        # Calculate MFE/MAE
+        if self.position.quantity > 0:  # Long position
+            mfe = (self._trade_high - self.position.entry_price) * self.point_value
+            mae = (self.position.entry_price - self._trade_low) * self.point_value
+        else:  # Short position
+            mfe = (self.position.entry_price - self._trade_low) * self.point_value
+            mae = (self._trade_high - self.position.entry_price) * self.point_value
+
+        # Record trade
+        trade = Trade(
+            entry_time=self.position.entry_time,
+            exit_time=timestamp,
+            side=self.position.quantity,
+            entry_price=self.position.entry_price,
+            exit_price=fill_price,
+            quantity=abs(self.position.quantity),
+            pnl=pnl,
+            commission=self.commission * 2,  # Entry + exit
+            duration_bars=duration,
+            max_favorable_excursion=mfe,
+            max_adverse_excursion=mae,
+        )
+        self.trades.append(trade)
+
+        logger.debug(
+            f"Closed position at {fill_price:.2f}, P&L: ${pnl:.2f}"
+        )
+
+        # Reset position
+        self.position = Position()
+
+    def _close_at_price_fast(self, exit_price: float, bar_idx: int) -> None:
+        """Close position at specified price (optimized)."""
+        if self.position.quantity == 0:
+            return
+
+        timestamp = self.timestamps[bar_idx]
+
+        # Calculate P&L
+        price_diff = exit_price - self.position.entry_price
+        pnl = price_diff * self.position.quantity * self.point_value
+        pnl -= self.commission  # Exit commission
+
+        # Update capital
+        self.capital += pnl
+        self.position.realized_pnl += pnl
+
+        # Calculate duration
+        if self.position.entry_time is not None:
+            entry_idx = np.searchsorted(self.timestamps, self.position.entry_time)
+            duration = self.current_bar - entry_idx
+        else:
+            duration = 0
+
+        # Calculate MFE/MAE
+        if self.position.quantity > 0:
+            mfe = (self._trade_high - self.position.entry_price) * self.point_value
+            mae = (self.position.entry_price - self._trade_low) * self.point_value
+        else:
+            mfe = (self.position.entry_price - self._trade_low) * self.point_value
+            mae = (self._trade_high - self.position.entry_price) * self.point_value
+
+        # Record trade
+        trade = Trade(
+            entry_time=self.position.entry_time,
+            exit_time=timestamp,
+            side=self.position.quantity,
+            entry_price=self.position.entry_price,
+            exit_price=exit_price,
+            quantity=abs(self.position.quantity),
+            pnl=pnl,
+            commission=self.commission * 2,
+            duration_bars=duration,
+            max_favorable_excursion=mfe,
+            max_adverse_excursion=mae,
+        )
+        self.trades.append(trade)
+
+        # Reset position
+        self.position = Position()
+        self._time_in_position = 0
+        self._stop_loss_price = 0.0
+        self._take_profit_price = 0.0
+
 
     def _execute_signal(self, signal: OrderSide, bar: pd.Series) -> None:
         """Execute a trading signal."""
@@ -572,6 +833,11 @@ class BacktestEngine:
         """Track maximum favorable/adverse excursion."""
         self._trade_high = max(self._trade_high, bar["high"])
         self._trade_low = min(self._trade_low, bar["low"])
+    
+    def _track_excursion_fast(self, high: float, low: float) -> None:
+        """Track maximum favorable/adverse excursion (optimized)."""
+        self._trade_high = max(self._trade_high, high)
+        self._trade_low = min(self._trade_low, low)
 
     def _compile_results(self) -> Dict[str, Any]:
         """Compile backtest results."""

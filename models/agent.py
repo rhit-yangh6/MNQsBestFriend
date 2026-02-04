@@ -16,7 +16,12 @@ import gymnasium as gym
 
 from config.settings import settings
 from env.trading_env import TradingEnv
-from .networks import LSTMFeatureExtractor, AttentionFeatureExtractor
+from .networks import (
+    LSTMFeatureExtractor, 
+    AttentionFeatureExtractor,
+    GRUFeatureExtractor,
+    ResidualLSTMFeatureExtractor
+)
 from .callbacks import TradingCallback, EvaluationCallback
 
 logger = logging.getLogger(__name__)
@@ -64,7 +69,8 @@ class TradingAgent:
             vf_coef: Value function coefficient
             max_grad_norm: Maximum gradient norm for clipping
             tensorboard_log: TensorBoard log directory
-            device: Device to use ('cpu', 'cuda', 'auto')
+            tensorboard_log: TensorBoard log directory
+            device: Device to use ('cpu', 'cuda', 'mps', 'auto')
             seed: Random seed
         """
         self.algorithm_name = algorithm
@@ -79,7 +85,14 @@ class TradingAgent:
         self.vf_coef = vf_coef
         self.max_grad_norm = max_grad_norm
         self.tensorboard_log = tensorboard_log
-        self.device = device
+        
+        # Auto-detect MPS
+        if device == "auto" and torch.backends.mps.is_available():
+            self.device = "mps"
+            logger.info("Using MPS (Metal Performance Shaders) acceleration")
+        else:
+            self.device = device
+            
         self.seed = seed
 
         self.env = env
@@ -161,6 +174,22 @@ class TradingAgent:
                 "features_dim": 256,
                 "num_heads": 4,
                 "num_layers": 2,
+                "dropout": 0.1,
+            }
+        elif self.feature_extractor_type == "gru":
+            features_extractor_class = GRUFeatureExtractor
+            features_extractor_kwargs = {
+                "features_dim": 256,
+                "gru_hidden_size": settings.LSTM_HIDDEN_SIZE,
+                "gru_num_layers": settings.LSTM_NUM_LAYERS,
+                "dropout": 0.1,
+            }
+        elif self.feature_extractor_type == "residual_lstm":
+            features_extractor_class = ResidualLSTMFeatureExtractor
+            features_extractor_kwargs = {
+                "features_dim": 256,
+                "lstm_hidden_size": settings.LSTM_HIDDEN_SIZE,
+                "lstm_num_layers": settings.LSTM_NUM_LAYERS,
                 "dropout": 0.1,
             }
         else:

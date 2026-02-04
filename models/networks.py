@@ -12,6 +12,158 @@ import gymnasium as gym
 from config.settings import settings
 
 
+class ResidualLSTM(nn.Module):
+    """LSTM with residual connections."""
+
+    def __init__(self, input_size: int, hidden_size: int, dropout: float = 0.0):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=1,
+            batch_first=True,
+        )
+        self.dropout = nn.Dropout(dropout)
+        
+        # Project input to hidden size if dimensions don't match
+        if input_size != hidden_size:
+            self.input_proj = nn.Linear(input_size, hidden_size)
+        else:
+            self.input_proj = nn.Identity()
+            
+        self.layer_norm = nn.LayerNorm(hidden_size)
+
+    def forward(
+        self, x: torch.Tensor, h: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        residual = self.input_proj(x)
+        out, h = self.lstm(x, h)
+        out = self.layer_norm(residual + self.dropout(out))
+        return out, h
+
+
+class GRUFeatureExtractor(BaseFeaturesExtractor):
+    """
+    GRU-based feature extractor.
+    
+    Faster than LSTM, often similar performance for trading tasks.
+    """
+
+    def __init__(
+        self,
+        observation_space: gym.spaces.Dict,
+        features_dim: int = 256,
+        gru_hidden_size: int = 128,
+        gru_num_layers: int = 2,
+        dropout: float = 0.1,
+    ):
+        """Initialize GRU feature extractor."""
+        super().__init__(observation_space, features_dim)
+
+        market_shape = observation_space["market_features"].shape
+        position_dim = observation_space["position_info"].shape[0]
+
+        self.input_dim = market_shape[1]
+        
+        # GRU for market features
+        self.gru = nn.GRU(
+            input_size=self.input_dim,
+            hidden_size=gru_hidden_size,
+            num_layers=gru_num_layers,
+            batch_first=True,
+            dropout=dropout if gru_num_layers > 1 else 0,
+        )
+
+        self.layer_norm = nn.LayerNorm(gru_hidden_size)
+        
+        # Combine GRU output with position info
+        combined_dim = gru_hidden_size + position_dim
+
+        self.fc = nn.Sequential(
+            nn.Linear(combined_dim, features_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(features_dim, features_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, observations: Dict[str, torch.Tensor]) -> torch.Tensor:
+        market_features = observations["market_features"]
+        position_info = observations["position_info"]
+
+        # GRU processing
+        gru_out, _ = self.gru(market_features)
+        
+        # Last hidden state
+        gru_final = gru_out[:, -1, :]
+        gru_final = self.layer_norm(gru_final)
+
+        # Combine
+        combined = torch.cat([gru_final, position_info], dim=-1)
+        
+        return self.fc(combined)
+
+
+class ResidualLSTMFeatureExtractor(BaseFeaturesExtractor):
+    """
+    LSTM feature extractor with residual connections.
+    
+    Better gradient flow for deeper networks.
+    """
+
+    def __init__(
+        self,
+        observation_space: gym.spaces.Dict,
+        features_dim: int = 256,
+        lstm_hidden_size: int = 128,
+        lstm_num_layers: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__(observation_space, features_dim)
+
+        market_shape = observation_space["market_features"].shape
+        position_dim = observation_space["position_info"].shape[0]
+
+        self.input_dim = market_shape[1]
+        
+        # Stack of Residual LSTMs
+        self.layers = nn.ModuleList([
+            ResidualLSTM(
+                input_size=self.input_dim if i == 0 else lstm_hidden_size,
+                hidden_size=lstm_hidden_size,
+                dropout=dropout
+            )
+            for i in range(lstm_num_layers)
+        ])
+        
+        # Combine
+        combined_dim = lstm_hidden_size + position_dim
+        
+        self.fc = nn.Sequential(
+            nn.Linear(combined_dim, features_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(features_dim, features_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, observations: Dict[str, torch.Tensor]) -> torch.Tensor:
+        x = observations["market_features"]
+        position_info = observations["position_info"]
+        
+        h = None
+        for layer in self.layers:
+            x, h = layer(x, h)
+            
+        # Last hidden state
+        final = x[:, -1, :]
+        
+        # Combine
+        combined = torch.cat([final, position_info], dim=-1)
+        
+        return self.fc(combined)
+
+
 class LSTMFeatureExtractor(BaseFeaturesExtractor):
     """
     LSTM-based feature extractor for sequential market data.
@@ -442,6 +594,10 @@ def create_feature_extractor(
     """
     if extractor_type == "lstm":
         return LSTMFeatureExtractor(observation_space, **kwargs)
+    elif extractor_type == "gru":
+        return GRUFeatureExtractor(observation_space, **kwargs)
+    elif extractor_type == "residual_lstm":
+        return ResidualLSTMFeatureExtractor(observation_space, **kwargs)
     elif extractor_type == "attention":
         return AttentionFeatureExtractor(observation_space, **kwargs)
     else:

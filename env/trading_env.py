@@ -115,6 +115,13 @@ class TradingEnv(gym.Env):
             ),
         })
 
+        # Pre-convert data to numpy for faster access
+        self.market_features_data = self.df[self.feature_columns].values.astype(np.float32)
+        self.close_prices = self.df["close"].values.astype(np.float32)
+        self.high_prices = self.df["high"].values.astype(np.float32)
+        self.low_prices = self.df["low"].values.astype(np.float32)
+        self.data_len = len(self.df)
+
         # Initialize state
         self._reset_state()
 
@@ -192,10 +199,9 @@ class TradingEnv(gym.Env):
         prev_equity = self.balance + self.unrealized_pnl
 
         # Get current bar's OHLC
-        current_bar = self.df.loc[self.current_step]
-        current_price = current_bar["close"]
-        high_price = current_bar["high"]
-        low_price = current_bar["low"]
+        current_price = self.close_prices[self.current_step]
+        high_price = self.high_prices[self.current_step]
+        low_price = self.low_prices[self.current_step]
 
         # Check SL first
         sl_reward = 0.0
@@ -217,7 +223,7 @@ class TradingEnv(gym.Env):
         # Update unrealized P&L
         if self.position != 0:
             self.time_in_position += 1
-            new_price = self.df.loc[self.current_step, "close"]
+            new_price = self.close_prices[self.current_step]
             self.unrealized_pnl = self._calculate_unrealized_pnl(new_price)
             # Track max unrealized profit
             self.max_unrealized_pnl = max(self.max_unrealized_pnl, self.unrealized_pnl)
@@ -252,7 +258,7 @@ class TradingEnv(gym.Env):
         terminated = False
         truncated = False
 
-        if self.current_step >= len(self.df) - 1:
+        if self.current_step >= self.data_len - 1:
             truncated = True
 
         if current_equity <= 0:
@@ -489,8 +495,7 @@ class TradingEnv(gym.Env):
         start_idx = self.current_step - self.lookback_window
         end_idx = self.current_step
 
-        market_data = self.df.loc[start_idx:end_idx - 1, self.feature_columns].values
-        market_features = np.array(market_data, dtype=np.float32)
+        market_features = self.market_features_data[start_idx:end_idx]
 
         # Position info
         current_equity = self.balance + self.unrealized_pnl
@@ -556,7 +561,7 @@ class TradingEnv(gym.Env):
     def render(self) -> Optional[np.ndarray]:
         """Render the environment."""
         if self.render_mode == "human":
-            current_price = self.df.loc[self.current_step, "close"]
+            current_price = self.close_prices[self.current_step]
             equity = self.balance + self.unrealized_pnl
             print(
                 f"Step: {self.current_step} | "
