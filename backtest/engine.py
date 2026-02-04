@@ -8,6 +8,7 @@ from enum import Enum, IntEnum
 from datetime import datetime
 import logging
 from pathlib import Path
+from tqdm import tqdm
 
 from config.settings import settings
 from .metrics import PerformanceMetrics
@@ -162,7 +163,7 @@ class BacktestEngine:
 
         logger.info(f"Starting backtest with {n_bars} bars")
 
-        for i in range(n_bars):
+        for i in tqdm(range(n_bars), desc="Backtesting", unit="bars"):
             self.current_bar = i
             bar = self.df.iloc[i]
 
@@ -237,7 +238,7 @@ class BacktestEngine:
         logger.info(f"Running model backtest with {n_bars} bars")
         logger.info(f"SL options: {self._sl_options} ticks")
 
-        for i in range(lookback_window, n_bars):
+        for i in tqdm(range(lookback_window, n_bars), desc="Backtesting", unit="bars"):
             self.current_bar = i
             bar = self.df.iloc[i]
 
