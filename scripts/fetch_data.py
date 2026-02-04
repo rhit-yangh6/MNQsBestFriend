@@ -334,11 +334,11 @@ def main():
                 logger.info(f"Updating existing file: {args.update}")
                 df = fetcher.update_data(args.update)
             elif total_days > 90:
-                # Multi-year data - iterate through individual contract expiries
+                # Multi-year data - use continuous contract with single request
                 years = max(1, total_days // 365)
-                logger.info(f"Fetching {years} years of data via individual contracts...")
+                logger.info(f"Fetching {years} years of data...")
 
-                df = fetch_by_contract_expiries(
+                df = fetch_continuous_all_at_once(
                     fetcher=fetcher,
                     years=years,
                     bar_size=args.bar_size,
