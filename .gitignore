@@ -1,0 +1,59 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data files (large)
+data/storage/*.parquet
+data/processed/*.parquet
+data/raw/
+
+# Trained models (large) - upload specific models manually
+models/train_*/
+!models/.gitkeep
+
+# Logs
+logs/
+*.log
+
+# Credentials - NEVER commit these
+config/ib_credentials.py
+config/.env
+.env
+*.pem
+*.key
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+scratchpad/
+
+# Test outputs
+backtest_*/
+test_results/
+
+# Joblib/pickle files (scaler, etc.) - model-specific
+*.joblib
+*.pkl
+
+# Coverage
+.coverage
+htmlcov/

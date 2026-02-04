@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    container_name: ib-gateway
+    ports:
+      - "4001:4001"  # Live trading API
+      - "4002:4002"  # Paper trading API
+      - "5900:5900"  # VNC for GUI access (optional)
+    environment:
+      # IBKR Credentials - Set these via environment or .env file
+      - TWS_USERID=${TWS_USERID}
+      - TWS_PASSWORD=${TWS_PASSWORD}
+      # Trading mode: paper or live
+      - TRADING_MODE=${TRADING_MODE:-paper}
+      # Auto-accept incoming connections
+      - TWS_ACCEPT_INCOMING=accept
+      # Timezone
+      - TZ=America/New_York
+    volumes:
+      # Persist IB Gateway settings
+      - ./ib-gateway-data:/root/Jts
+    restart: unless-stopped
+    # Health check
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "4002"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+# To use:
+# 1. Create .env file with TWS_USERID and TWS_PASSWORD
+# 2. Run: docker-compose up -d
+# 3. Check logs: docker-compose logs -f
+# 4. Stop: docker-compose down

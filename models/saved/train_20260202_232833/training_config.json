@@ -1,0 +1,8 @@
+{
+  "algorithm": "PPO",
+  "feature_extractor": "lstm",
+  "reward_type": "sharpe",
+  "lookback_window": 50,
+  "min_holding_bars": 6,
+  "max_holding_bars": 120
+}
