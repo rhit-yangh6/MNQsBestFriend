@@ -437,7 +437,7 @@ class TradingEnv(gym.Env):
             returns_history=self.returns_history,
         )
 
-        # Bonus for good exits
+        # Bonus/penalty for different exit types
         if exit_type == "AGENT_CLOSE":
             if pnl > 0:
                 # Reward for taking profit - bonus if captured most of the max
@@ -445,18 +445,27 @@ class TradingEnv(gym.Env):
                     capture_ratio = pnl / self.max_unrealized_pnl
                     base_reward *= (1.0 + 0.3 * capture_ratio)
             else:
-                # Cutting losses early is good (if not at SL)
+                # SIGNIFICANT BONUS for cutting losses early (before SL)
                 max_sl_loss = self.current_sl_ticks * settings.TICK_SIZE * settings.POINT_VALUE
                 if max_sl_loss > 0:
                     loss_ratio = abs(pnl) / max_sl_loss
-                    if loss_ratio < 0.5:  # Cut loss at less than 50% of max
-                        base_reward *= 0.8  # Less penalty for smart exit
+                    # The earlier you cut, the bigger the bonus
+                    if loss_ratio < 0.3:  # Cut at less than 30% of max loss
+                        base_reward *= 0.4  # 60% reduction in penalty - great exit!
+                        base_reward += 0.5  # Bonus for smart early exit
+                    elif loss_ratio < 0.5:  # Cut at less than 50%
+                        base_reward *= 0.6  # 40% reduction in penalty
+                        base_reward += 0.3  # Small bonus
+                    elif loss_ratio < 0.7:  # Cut at less than 70%
+                        base_reward *= 0.8  # 20% reduction
+                    # else: no bonus for cutting close to SL
 
         elif exit_type == "STOP_LOSS":
-            # Penalty for hitting stop loss, but less if using tight SL
+            # PENALTY for hitting stop loss - you should have closed earlier!
             # Tight SL (low level) = less penalty, Wide SL (high level) = more penalty
-            sl_penalty_factor = 1.2 + (self.current_sl_level * 0.15)
+            sl_penalty_factor = 1.3 + (self.current_sl_level * 0.2)
             base_reward *= sl_penalty_factor
+            base_reward -= 0.3  # Additional flat penalty for hitting SL
 
         # Reset state
         self.position = 0
