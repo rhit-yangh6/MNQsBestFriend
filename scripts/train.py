@@ -59,7 +59,7 @@ def main():
     parser.add_argument(
         "--data",
         type=str,
-        required=True,
+        default="data/processed/MNQ_5min_databento.parquet",
         help="Path to training data (parquet file)",
     )
     parser.add_argument(
