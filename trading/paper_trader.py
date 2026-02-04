@@ -158,8 +158,8 @@ class PaperTrader:
 
     def disconnect(self) -> None:
         """Disconnect from IBKR."""
-        # Save any remaining trades before disconnect
-        self._save_daily_trades()
+        # Save any remaining trades with summary before disconnect
+        self._save_daily_trades(include_summary=True)
 
         if self.ib and self.ib.isConnected():
             self.ib.disconnect()
@@ -169,8 +169,8 @@ class PaperTrader:
         """Get CSV file path for a given date."""
         return self.log_dir / f"trades_{trade_date.strftime('%Y%m%d')}.csv"
 
-    def _save_daily_trades(self) -> None:
-        """Save daily trades to CSV."""
+    def _save_daily_trades(self, include_summary: bool = False) -> None:
+        """Save daily trades to CSV with optional summary row."""
         if not self.daily_trades:
             return
 
@@ -196,6 +196,63 @@ class PaperTrader:
 
         logger.info(f"Saved {len(self.daily_trades)} trades to {csv_path}")
         self.daily_trades = []
+
+        # Add summary if requested (end of day or shutdown)
+        if include_summary:
+            self._write_daily_summary(csv_path)
+
+    def _write_daily_summary(self, csv_path: Path) -> None:
+        """Write a summary row at the end of the daily CSV."""
+        # Calculate summary stats
+        total_trades = self.trade_count
+        win_rate = (self.winning_trades / total_trades * 100) if total_trades > 0 else 0
+        avg_pnl = self.daily_pnl / total_trades if total_trades > 0 else 0
+
+        summary_path = csv_path.with_suffix('.summary.txt')
+
+        with open(summary_path, 'w') as f:
+            f.write("=" * 50 + "\n")
+            f.write(f"DAILY SUMMARY - {self.current_trade_date}\n")
+            f.write("=" * 50 + "\n")
+            f.write(f"Total Trades:    {total_trades}\n")
+            f.write(f"Winning Trades:  {self.winning_trades}\n")
+            f.write(f"Losing Trades:   {self.losing_trades}\n")
+            f.write(f"Win Rate:        {win_rate:.1f}%\n")
+            f.write(f"Daily P&L:       ${self.daily_pnl:.2f}\n")
+            f.write(f"Total P&L:       ${self.total_pnl:.2f}\n")
+            f.write(f"Avg P&L/Trade:   ${avg_pnl:.2f}\n")
+            f.write("=" * 50 + "\n")
+
+            # SL level distribution
+            if hasattr(self, '_sl_level_counts'):
+                f.write("\nSL Level Distribution:\n")
+                for level, count in self._sl_level_counts.items():
+                    f.write(f"  Level {level}: {count} trades\n")
+
+        logger.info(f"Saved daily summary to {summary_path}")
+
+        # Also append summary row to CSV
+        with open(csv_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([])  # Empty row
+            writer.writerow(['--- SUMMARY ---', '', '', '', '', '', '', '', '', '', '', '', '', '', ''])
+            writer.writerow([
+                f'Trades: {total_trades}',
+                f'Wins: {self.winning_trades}',
+                f'Losses: {self.losing_trades}',
+                f'Win Rate: {win_rate:.1f}%',
+                '',
+                '',
+                '',
+                '',
+                f'Daily P&L: ${self.daily_pnl:.2f}',
+                '',
+                '',
+                '',
+                '',
+                '',
+                f'Total P&L: ${self.total_pnl:.2f}'
+            ])
 
     def _log_trade(self, trade_data: Dict) -> None:
         """Log a trade to the daily buffer."""
