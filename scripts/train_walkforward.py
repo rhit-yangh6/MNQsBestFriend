@@ -93,12 +93,14 @@ class WalkForwardTrainer:
         config: WalkForwardConfig,
         output_dir: Path,
         fixed_sl_ticks: float = 200.0,
+        preprocessor: Optional[DataPreprocessor] = None,
     ):
-        self.df = df
+        self.df = df  # Unscaled data
         self.feature_columns = feature_columns
         self.config = config
         self.output_dir = output_dir
         self.fixed_sl_ticks = fixed_sl_ticks
+        self.preprocessor = preprocessor or DataPreprocessor(scaler_type="robust")
 
         self.total_bars = len(df)
         self.results: List[Dict] = []
@@ -201,7 +203,7 @@ class WalkForwardTrainer:
         # Sharpe-like ratio (simplified)
         if len(all_equity) > 1:
             returns = np.diff(all_equity) / all_equity[:-1]
-            sharpe_ratio = np.mean(returns) / (np.std(returns) + 1e-8) * np.sqrt(252 * 78)
+            sharpe_ratio = np.mean(returns) / (np.std(returns) + 1e-8) * np.sqrt(252 * 276)  # Full ETH
         else:
             sharpe_ratio = 0.0
 
@@ -260,11 +262,20 @@ class WalkForwardTrainer:
             logger.info("Not enough data for this fold, skipping")
             return {}
 
-        train_df = self.df.iloc[train_start:train_end].reset_index(drop=True)
-        val_df = self.df.iloc[train_end:val_end].reset_index(drop=True)
+        train_df_raw = self.df.iloc[train_start:train_end].reset_index(drop=True)
+        val_df_raw = self.df.iloc[train_end:val_end].reset_index(drop=True)
 
-        logger.info(f"Train: bars {train_start}-{train_end} ({len(train_df)} bars)")
-        logger.info(f"Val: bars {train_end}-{val_end} ({len(val_df)} bars)")
+        logger.info(f"Train: bars {train_start}-{train_end} ({len(train_df_raw)} bars)")
+        logger.info(f"Val: bars {train_end}-{val_end} ({len(val_df_raw)} bars)")
+
+        # Fit scaler on TRAINING data only (prevents leakage)
+        fold_preprocessor = DataPreprocessor(scaler_type="robust")
+        fold_preprocessor.fit(train_df_raw, self.feature_columns)
+
+        # Transform both splits using training-fitted scaler
+        train_df = fold_preprocessor.transform(train_df_raw)
+        val_df = fold_preprocessor.transform(val_df_raw)
+        logger.info("Scaler fitted on training data only (no leakage)")
 
         if len(train_df) < settings.LOOKBACK_WINDOW * 2 or len(val_df) < settings.LOOKBACK_WINDOW * 2:
             logger.info("Insufficient data, skipping fold")
@@ -303,6 +314,7 @@ class WalkForwardTrainer:
         checkpoint_num = 0
         best_fold_score = -np.inf
         best_fold_model = None
+        best_fold_preprocessor = fold_preprocessor  # Track scaler for best model
 
         while timesteps_trained < timesteps:
             # Train for checkpoint interval
@@ -355,12 +367,15 @@ class WalkForwardTrainer:
                 trades_per_day=0, win_rate_pct=0, score=-100
             )
 
-        # Save global best
+        # Save global best (model + scaler)
         if final_metrics.score > self.best_score:
             self.best_score = final_metrics.score
             self.best_model_path = self.output_dir / "best_model_overall"
             agent.save(self.best_model_path)
+            # Save scaler for inference
+            best_fold_preprocessor.save_scaler(self.output_dir / "scaler.joblib")
             logger.info(f"New global best! Score: {final_metrics.score:.2f}")
+            logger.info(f"Saved scaler to {self.output_dir / 'scaler.joblib'}")
 
         result = {
             "fold": fold,
@@ -439,7 +454,7 @@ def main():
     df = pd.read_parquet(args.data)
     logger.info(f"Loaded {len(df)} bars")
 
-    # Preprocess
+    # Preprocess (clean only, NO scaling - scaling done per-fold to prevent leakage)
     preprocessor = DataPreprocessor(scaler_type="robust")
     df = preprocessor.clean_data(df)
 
@@ -448,8 +463,8 @@ def main():
     df = feature_engineer.compute_all_features(df)
     feature_columns = feature_engineer.feature_names
 
-    # Normalize
-    df = preprocessor.fit_transform(df, feature_columns)
+    # NOTE: No fit_transform here - each fold fits scaler on its training window only
+    logger.info("Scaling will be applied per-fold on training data only (no leakage)")
 
     # Config
     config = WalkForwardConfig(

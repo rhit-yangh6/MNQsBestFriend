@@ -187,7 +187,7 @@ class FeatureEngineer:
 
         # Rolling volatility
         for window in [10, 20, 50]:
-            df[f"volatility_{window}"] = df["returns"].rolling(window).std() * np.sqrt(252 * 78)  # Annualized
+            df[f"volatility_{window}"] = df["returns"].rolling(window).std() * np.sqrt(252 * 276)  # Annualized (full ETH)
 
         # Garman-Klass volatility
         df["gk_volatility"] = self._garman_klass_volatility(df, window=20)
@@ -308,12 +308,12 @@ class FeatureEngineer:
         log_co = np.log(df["close"] / df["open"]) ** 2
 
         gk = 0.5 * log_hl - (2 * np.log(2) - 1) * log_co
-        return np.sqrt(gk.rolling(window).mean() * 252 * 78)
+        return np.sqrt(gk.rolling(window).mean() * 252 * 276)  # Full ETH
 
     def _parkinson_volatility(self, df: pd.DataFrame, window: int = 20) -> pd.Series:
         """Calculate Parkinson volatility estimator."""
         log_hl_sq = np.log(df["high"] / df["low"]) ** 2
-        return np.sqrt(log_hl_sq.rolling(window).mean() / (4 * np.log(2)) * 252 * 78)
+        return np.sqrt(log_hl_sq.rolling(window).mean() / (4 * np.log(2)) * 252 * 276)  # Full ETH
 
     def get_feature_names(self) -> List[str]:
         """Get list of computed feature names."""

@@ -36,7 +36,7 @@ class PerformanceMetrics:
         equity_curve: np.ndarray,
         initial_capital: float = 10000.0,
         risk_free_rate: float = 0.02,  # Annual risk-free rate
-        periods_per_year: int = 252 * 78,  # 5-min bars per year
+        periods_per_year: int = 252 * 276,  # 5-min bars per year (full ETH: 23h * 12 bars/hr)
     ):
         """
         Initialize performance metrics calculator.
@@ -373,7 +373,7 @@ class PerformanceMetrics:
 def calculate_sharpe_ratio(
     returns: np.ndarray,
     risk_free_rate: float = 0.02,
-    periods_per_year: int = 252 * 78,
+    periods_per_year: int = 252 * 276,  # Full ETH: 23h * 12 bars/hr
 ) -> float:
     """Quick Sharpe ratio calculation."""
     if len(returns) < 2:

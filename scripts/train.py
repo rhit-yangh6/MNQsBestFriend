@@ -26,13 +26,13 @@ logger = setup_logger("train", level="INFO")
 
 
 def load_and_prepare_data(data_path: Path, compute_features: bool = True):
-    """Load and prepare data for training."""
+    """Load and prepare data for training (unscaled - scaling done after split)."""
     logger.info(f"Loading data from {data_path}")
 
     df = pd.read_parquet(data_path)
     logger.info(f"Loaded {len(df)} rows")
 
-    # Preprocess
+    # Preprocess (clean only, no scaling yet)
     preprocessor = DataPreprocessor(scaler_type="robust")
     df = preprocessor.clean_data(df)
 
@@ -48,9 +48,8 @@ def load_and_prepare_data(data_path: Path, compute_features: bool = True):
 
     logger.info(f"Using {len(feature_columns)} features")
 
-    # Normalize features
-    df = preprocessor.fit_transform(df, feature_columns)
-
+    # Return unscaled data - scaling happens after train/val/test split
+    # to prevent data leakage
     return df, feature_columns, preprocessor
 
 
@@ -182,10 +181,10 @@ def main():
     logger.info(f"Output: {output_dir}")
     logger.info("=" * 50)
 
-    # Load data
+    # Load data (unscaled)
     df, feature_columns, preprocessor = load_and_prepare_data(Path(args.data))
 
-    # Split data
+    # Split data BEFORE scaling (prevents leakage)
     n = len(df)
     train_end = int(n * settings.TRAIN_SPLIT)
     val_end = int(n * (settings.TRAIN_SPLIT + settings.VAL_SPLIT))
@@ -195,6 +194,15 @@ def main():
     test_df = df.iloc[val_end:].reset_index(drop=True)
 
     logger.info(f"Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
+
+    # Fit scaler on TRAINING data only (prevents leakage)
+    preprocessor.fit(train_df, feature_columns)
+    logger.info("Scaler fitted on training data only (no leakage)")
+
+    # Transform all splits using fitted scaler
+    train_df = preprocessor.transform(train_df)
+    val_df = preprocessor.transform(val_df)
+    test_df = preprocessor.transform(test_df)
 
     # Save preprocessor
     preprocessor.save_scaler(output_dir / "scaler.joblib")

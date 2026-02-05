@@ -175,8 +175,8 @@ class TradingCallback(BaseCallback):
         # === TRADE FREQUENCY METRICS ===
         mean_trades = self._recent_trades / self.log_freq if self.log_freq > 0 else 0
 
-        # Trades per day (assuming 78 bars per RTH day for 5-min bars)
-        bars_per_day = 78
+        # Trades per day (full ETH: 23h * 12 bars/hr = 276 bars)
+        bars_per_day = 276
         episode_days = self._recent_bars / bars_per_day if bars_per_day > 0 else 1
         trades_per_day = self._recent_trades / max(episode_days, 1)
 
@@ -467,7 +467,7 @@ class SharpeCallback(BaseCallback):
             recent_returns = np.array(self.returns_history[-self.window_size:])
             mean_return = np.mean(recent_returns)
             std_return = np.std(recent_returns) + 1e-8
-            sharpe = mean_return / std_return * np.sqrt(252 * 78)  # Annualized
+            sharpe = mean_return / std_return * np.sqrt(252 * 276)  # Annualized (full ETH)
 
             self.sharpe_history.append(sharpe)
 
