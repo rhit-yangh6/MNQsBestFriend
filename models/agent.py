@@ -374,7 +374,7 @@ class TradingAgent:
             "mean_reward": np.mean(episode_rewards),
             "std_reward": np.std(episode_rewards),
             "mean_length": np.mean(episode_lengths),
-            "mean_trades": np.mean(episode_trades),
+            "avg_trades_per_episode": np.mean(episode_trades),
             "mean_profit": np.mean(episode_profits),
             "total_profit": np.sum(episode_profits),
         }

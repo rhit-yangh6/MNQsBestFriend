@@ -43,13 +43,14 @@ class EvalMetrics:
     """Evaluation metrics for a model checkpoint."""
     total_return_pct: float
     max_drawdown_pct: float
-    profit_factor: float
+    profit_factor: float  # Primary metric
+    total_profit: float   # Secondary metric (dollars)
     sharpe_ratio: float
     avg_trade_pnl: float
     total_trades: int
-    trades_per_day: float
+    trades_per_day: float  # Secondary metric
     win_rate_pct: float
-    score: float  # val_return - 2.0 * val_max_drawdown
+    score: float  # total_profit - 1.5 * max_drawdown
 
 
 @dataclass
@@ -164,6 +165,7 @@ class WalkForwardTrainer:
                 total_return_pct=0.0,
                 max_drawdown_pct=100.0,
                 profit_factor=0.0,
+                total_profit=0.0,
                 sharpe_ratio=0.0,
                 avg_trade_pnl=0.0,
                 total_trades=0,
@@ -195,10 +197,13 @@ class WalkForwardTrainer:
         win_rate_pct = (len(wins) / total_trades * 100) if total_trades > 0 else 0
         avg_trade_pnl = sum(t['pnl'] for t in all_trades) / total_trades if total_trades > 0 else 0
 
-        # Trades per day (assuming 5-min bars, ~78 bars per RTH day)
+        # Trades per day (full ETH: 276 bars per day)
         bars_in_val = len(val_df)
-        trading_days = bars_in_val / 78
+        trading_days = bars_in_val / 276
         trades_per_day = total_trades / max(trading_days, 1)
+
+        # Total profit in dollars
+        total_profit = final - initial
 
         # Sharpe-like ratio (simplified)
         if len(all_equity) > 1:
@@ -207,13 +212,15 @@ class WalkForwardTrainer:
         else:
             sharpe_ratio = 0.0
 
-        # Score function: val_return - 2.0 * val_max_drawdown
-        score = total_return_pct - 2.0 * max_drawdown_pct
+        # Score function: total_profit - 1.5 * max_drawdown
+        # Primary: profit_factor, Secondary: total_profit, max_drawdown, trades_per_day
+        score = total_profit - 1.5 * (max_drawdown_pct / 100.0 * initial)
 
         return EvalMetrics(
             total_return_pct=total_return_pct,
             max_drawdown_pct=max_drawdown_pct,
             profit_factor=profit_factor,
+            total_profit=total_profit,
             sharpe_ratio=sharpe_ratio,
             avg_trade_pnl=avg_trade_pnl,
             total_trades=total_trades,
@@ -337,11 +344,12 @@ class WalkForwardTrainer:
                 logger.info(f"Evaluating checkpoint {checkpoint_num}...")
                 metrics = self._evaluate_model(agent, val_df)
 
-                logger.info(f"  Return: {metrics.total_return_pct:.2f}%")
+                logger.info(f"  PF: {metrics.profit_factor:.2f} (primary)")
+                logger.info(f"  Profit: ${metrics.total_profit:.2f}")
                 logger.info(f"  Max DD: {metrics.max_drawdown_pct:.2f}%")
-                logger.info(f"  PF: {metrics.profit_factor:.2f}")
-                logger.info(f"  Trades: {metrics.total_trades}")
-                logger.info(f"  Score: {metrics.score:.2f}")
+                logger.info(f"  Trades/Day: {metrics.trades_per_day:.1f}")
+                logger.info(f"  Win Rate: {metrics.win_rate_pct:.1f}%")
+                logger.info(f"  Score: {metrics.score:.2f} (profit - 1.5*DD)")
 
                 # Save if best for this fold
                 if metrics.score > best_fold_score:
@@ -363,7 +371,7 @@ class WalkForwardTrainer:
         else:
             final_metrics = EvalMetrics(
                 total_return_pct=0, max_drawdown_pct=100, profit_factor=0,
-                sharpe_ratio=0, avg_trade_pnl=0, total_trades=0,
+                total_profit=0, sharpe_ratio=0, avg_trade_pnl=0, total_trades=0,
                 trades_per_day=0, win_rate_pct=0, score=-100
             )
 

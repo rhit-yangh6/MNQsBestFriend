@@ -19,7 +19,7 @@ class TradingCallback(BaseCallback):
     Metrics corrections applied:
     - profit_factor: sum(gross_profit) / abs(sum(gross_loss)) - NOT averaged
     - win_rate: total_winning_trades / total_trades - NOT averaged
-    - trade_frequency: trades_per_day, trades_per_1000_bars, avg_holding_bars
+    - trade_frequency: trades_per_bar, trades_per_100_bars, trades_per_1000_bars, trades_per_day, avg_holding_bars
     """
 
     def __init__(
@@ -173,15 +173,17 @@ class TradingCallback(BaseCallback):
             win_rate = 0
 
         # === TRADE FREQUENCY METRICS ===
-        mean_trades = self._recent_trades / self.log_freq if self.log_freq > 0 else 0
+        avg_trades_per_episode = self._recent_trades / self.log_freq if self.log_freq > 0 else 0
 
         # Trades per day (full ETH: 23h * 12 bars/hr = 276 bars)
         bars_per_day = 276
         episode_days = self._recent_bars / bars_per_day if bars_per_day > 0 else 1
         trades_per_day = self._recent_trades / max(episode_days, 1)
 
-        # Trades per 1000 bars
-        trades_per_1000_bars = (self._recent_trades / max(self._recent_bars, 1)) * 1000
+        # Trades per bar (primary frequency metric for turnover tuning)
+        trades_per_bar = self._recent_trades / max(self._recent_bars, 1)
+        trades_per_100_bars = trades_per_bar * 100
+        trades_per_1000_bars = trades_per_bar * 1000
 
         # Average holding bars
         avg_holding_bars = self._recent_bars / max(self._recent_trades, 1)
@@ -198,10 +200,12 @@ class TradingCallback(BaseCallback):
             self.logger.record("trading/profit_factor", profit_factor)
             self.logger.record("trading/win_rate", win_rate)
 
-            # Trade frequency metrics
-            self.logger.record("trading/mean_trades", mean_trades)
-            self.logger.record("trading/trades_per_day", trades_per_day)
+            # Trade frequency metrics (per-bar metrics for turnover tuning)
+            self.logger.record("trading/trades_per_bar", trades_per_bar)
+            self.logger.record("trading/trades_per_100_bars", trades_per_100_bars)
             self.logger.record("trading/trades_per_1000_bars", trades_per_1000_bars)
+            self.logger.record("trading/trades_per_day", trades_per_day)
+            self.logger.record("trading/avg_trades_per_episode", avg_trades_per_episode)
             self.logger.record("trading/avg_holding_bars", avg_holding_bars)
 
             # Episode count
@@ -212,7 +216,7 @@ class TradingCallback(BaseCallback):
                 f"Episodes: {self.n_episodes} | "
                 f"Reward: {mean_reward:.2f} | "
                 f"Profit: ${mean_profit:.2f} | "
-                f"Trades: {mean_trades:.1f} | "
+                f"Trades: {avg_trades_per_episode:.1f} | "
                 f"WinRate: {win_rate:.1f}% | "
                 f"PF: {profit_factor:.2f} | "
                 f"Trades/Day: {trades_per_day:.1f}"
@@ -253,7 +257,11 @@ class TradingCallback(BaseCallback):
 
 class EvaluationCallback(EvalCallback):
     """
-    Extended evaluation callback with trading-specific metrics and progress bar.
+    Extended evaluation callback with trading-specific metrics.
+
+    Model selection uses: score = total_profit - 1.5 * max_drawdown
+    Primary metric: profit_factor
+    Secondary metrics: total_profit, max_drawdown, trades_per_day
     """
 
     def __init__(
@@ -266,7 +274,7 @@ class EvaluationCallback(EvalCallback):
         deterministic: bool = True,
         verbose: int = 1,
         early_stopping_patience: int = 10,
-        min_improvement: float = 0.01,
+        min_improvement: float = 50.0,  # Score improvement threshold (dollars)
     ):
         """
         Initialize evaluation callback.
@@ -280,7 +288,7 @@ class EvaluationCallback(EvalCallback):
             deterministic: Use deterministic policy
             verbose: Verbosity level
             early_stopping_patience: Number of evals without improvement before stopping
-            min_improvement: Minimum improvement threshold
+            min_improvement: Minimum score improvement threshold
         """
         super().__init__(
             eval_env=eval_env,
@@ -295,15 +303,16 @@ class EvaluationCallback(EvalCallback):
         self.early_stopping_patience = early_stopping_patience
         self.min_improvement = min_improvement
         self.no_improvement_count = 0
-        self.best_sharpe = -np.inf
+        self.best_score = -np.inf  # score = total_profit - 1.5 * max_drawdown
         self.eval_history: List[Dict] = []
 
-    def _evaluate_with_progress(self) -> tuple:
-        """Run evaluation with progress bar."""
+    def _evaluate_with_trading_metrics(self) -> Dict[str, Any]:
+        """Run evaluation and collect trading metrics."""
         from tqdm import tqdm
 
         episode_rewards = []
         episode_lengths = []
+        episode_infos = []  # Collect final info from each episode
 
         obs = self.eval_env.reset()
         n_envs = self.eval_env.num_envs
@@ -324,6 +333,7 @@ class EvaluationCallback(EvalCallback):
                 if done and episode_counts[i] < self.n_eval_episodes:
                     episode_rewards.append(current_rewards[i])
                     episode_lengths.append(current_lengths[i])
+                    episode_infos.append(infos[i])  # Store final episode info
                     episode_counts[i] += 1
                     pbar.update(1)
                     pbar.set_postfix({"reward": f"{current_rewards[i]:.2f}"})
@@ -331,56 +341,94 @@ class EvaluationCallback(EvalCallback):
                     current_lengths[i] = 0
 
         pbar.close()
-        return episode_rewards, episode_lengths
+
+        # Aggregate trading metrics from all episodes
+        total_gross_profit = sum(info.get("gross_profit", 0) for info in episode_infos)
+        total_gross_loss = sum(info.get("gross_loss", 0) for info in episode_infos)
+        total_trades = sum(info.get("total_trades", 0) for info in episode_infos)
+        total_winning_trades = sum(info.get("winning_trades", 0) for info in episode_infos)
+        total_bars = sum(episode_lengths)
+
+        # Calculate metrics
+        profit_factor = total_gross_profit / max(abs(total_gross_loss), 0.01)
+        win_rate = (total_winning_trades / max(total_trades, 1)) * 100
+        total_profit = sum(info.get("realized_pnl", 0) for info in episode_infos)
+        max_drawdown = max(info.get("drawdown", 0) for info in episode_infos) * 100
+
+        # Trades per day (full ETH: 276 bars per day)
+        trading_days = total_bars / 276
+        trades_per_day = total_trades / max(trading_days, 1)
+
+        # Model selection score: total_profit - 1.5 * max_drawdown_dollars
+        initial_balance = 10000.0  # Default
+        max_drawdown_dollars = (max_drawdown / 100.0) * initial_balance
+        score = total_profit - 1.5 * max_drawdown_dollars
+
+        return {
+            "episode_rewards": episode_rewards,
+            "episode_lengths": episode_lengths,
+            "profit_factor": profit_factor,
+            "total_profit": total_profit,
+            "max_drawdown": max_drawdown,
+            "trades_per_day": trades_per_day,
+            "win_rate": win_rate,
+            "total_trades": total_trades,
+            "score": score,
+            "mean_reward": np.mean(episode_rewards),
+            "std_reward": np.std(episode_rewards),
+        }
 
     def _on_step(self) -> bool:
         """Called after each step."""
         continue_training = True
 
         if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
-            # Run evaluation with progress bar
+            # Run evaluation with trading metrics
             logger.info(f"Starting evaluation at timestep {self.num_timesteps}...")
-            episode_rewards, episode_lengths = self._evaluate_with_progress()
+            metrics = self._evaluate_with_trading_metrics()
 
-            mean_reward = np.mean(episode_rewards)
-            std_reward = np.std(episode_rewards)
-            self.last_mean_reward = mean_reward
+            self.last_mean_reward = metrics["mean_reward"]
 
             # Store results
-            self.evaluations_results.append(episode_rewards)
+            self.evaluations_results.append(metrics["episode_rewards"])
             self.evaluations_timesteps.append(self.num_timesteps)
-            self.evaluations_length.append(episode_lengths)
+            self.evaluations_length.append(metrics["episode_lengths"])
 
-            # Log results
+            # Log results with trading metrics
             if self.verbose >= 1:
-                logger.info(f"Eval: mean_reward={mean_reward:.2f} +/- {std_reward:.2f}, episodes={len(episode_rewards)}")
+                logger.info(
+                    f"Eval: PF={metrics['profit_factor']:.2f} | "
+                    f"Profit=${metrics['total_profit']:.2f} | "
+                    f"MaxDD={metrics['max_drawdown']:.1f}% | "
+                    f"Trades/Day={metrics['trades_per_day']:.1f} | "
+                    f"WinRate={metrics['win_rate']:.1f}% | "
+                    f"Score={metrics['score']:.2f}"
+                )
 
-            # Save best model
-            if mean_reward > self.best_mean_reward:
-                self.best_mean_reward = mean_reward
+            # Save best model based on SCORE (not mean_reward)
+            if metrics["score"] > self.best_score + self.min_improvement:
+                self.best_score = metrics["score"]
+                self.no_improvement_count = 0
                 if self.best_model_save_path is not None:
                     self.model.save(f"{self.best_model_save_path}/best_model")
-                    logger.info(f"New best model saved with reward: {mean_reward:.2f}")
+                    logger.info(f"New best model! Score: {metrics['score']:.2f}")
+            else:
+                self.no_improvement_count += 1
 
-            # Continue with Sharpe tracking
-            if len(episode_rewards) > 0:
-                sharpe = mean_reward / (std_reward + 1e-8)
-                self.eval_history.append({
-                    "timestep": self.num_timesteps,
-                    "mean_return": mean_reward,
-                    "std_return": std_reward,
-                    "sharpe": sharpe,
-                })
+            # Track history
+            self.eval_history.append({
+                "timestep": self.num_timesteps,
+                "profit_factor": metrics["profit_factor"],
+                "total_profit": metrics["total_profit"],
+                "max_drawdown": metrics["max_drawdown"],
+                "trades_per_day": metrics["trades_per_day"],
+                "score": metrics["score"],
+            })
 
-                if sharpe > self.best_sharpe + self.min_improvement:
-                    self.best_sharpe = sharpe
-                    self.no_improvement_count = 0
-                else:
-                    self.no_improvement_count += 1
-
-                if self.no_improvement_count >= self.early_stopping_patience:
-                    logger.info(f"Early stopping after {self.no_improvement_count} evals without improvement")
-                    return False
+            # Early stopping based on score
+            if self.no_improvement_count >= self.early_stopping_patience:
+                logger.info(f"Early stopping after {self.no_improvement_count} evals without improvement")
+                return False
 
         return continue_training
 

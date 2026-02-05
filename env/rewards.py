@@ -38,6 +38,10 @@ class RewardCalculator:
 
     STOPLOSS_EXTRA_PENALTY = 1.0
 
+    # === STABILITY GUARDS ===
+    MAX_PROFIT_TERM = 1.0
+    MAX_DRAWDOWN_PENALTY_PER_STEP = 1.0
+
     def __init__(self, reward_scaling: float = 1.0):
         self.reward_scaling = reward_scaling
         self._equity_prev = 0.0
@@ -100,11 +104,13 @@ class RewardCalculator:
 
         # === REWARD TERMS ===
 
-        # 1. Profit (bounded by tanh)
+        # 1. Profit (bounded by tanh, capped for stability)
         profit = np.tanh(self.PROFIT_SCALE * step_return)
+        profit = min(profit, self.MAX_PROFIT_TERM)  # Stability guard
 
-        # 2. Drawdown increase penalty
+        # 2. Drawdown increase penalty (capped for stability)
         drawdown_increase = self.DRAWDOWN_PENALTY * max(0.0, drawdown_now - drawdown_prev)
+        drawdown_increase = min(drawdown_increase, self.MAX_DRAWDOWN_PENALTY_PER_STEP)  # Stability guard
 
         # 3. Volatility penalty (penalize large swings)
         volatility = self.VOLATILITY_PENALTY * step_return * step_return
