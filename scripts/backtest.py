@@ -101,6 +101,17 @@ def main():
         default=True,
         help="Use deterministic policy",
     )
+    parser.add_argument(
+        "--slow",
+        action="store_true",
+        help="Use slow per-bar inference (more accurate position tracking, 10-50x slower)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1024,
+        help="Batch size for fast inference (default: 1024)",
+    )
 
     args = parser.parse_args()
 
@@ -180,13 +191,25 @@ def main():
         slippage_ticks=args.slippage,
     )
 
-    results = engine.run_with_model(
-        model=agent,
-        feature_columns=available_features,
-        lookback_window=lookback_window,
-        deterministic=args.deterministic,
-        fixed_sl_ticks=fixed_sl_ticks,
-    )
+    if args.slow:
+        logger.info("Using SLOW per-bar inference mode")
+        results = engine.run_with_model(
+            model=agent,
+            feature_columns=available_features,
+            lookback_window=lookback_window,
+            deterministic=args.deterministic,
+            fixed_sl_ticks=fixed_sl_ticks,
+        )
+    else:
+        # Fast mode is default
+        results = engine.run_fast_with_model(
+            model=agent,
+            feature_columns=available_features,
+            lookback_window=lookback_window,
+            deterministic=args.deterministic,
+            fixed_sl_ticks=fixed_sl_ticks,
+            batch_size=args.batch_size,
+        )
 
     # Print results
     logger.info("=" * 50)

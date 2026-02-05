@@ -95,6 +95,7 @@ class WalkForwardTrainer:
         output_dir: Path,
         fixed_sl_ticks: float = 200.0,
         preprocessor: Optional[DataPreprocessor] = None,
+        resume_path: Optional[Path] = None,
     ):
         self.df = df  # Unscaled data
         self.feature_columns = feature_columns
@@ -102,6 +103,7 @@ class WalkForwardTrainer:
         self.output_dir = output_dir
         self.fixed_sl_ticks = fixed_sl_ticks
         self.preprocessor = preprocessor or DataPreprocessor(scaler_type="robust")
+        self.resume_path = resume_path
 
         self.total_bars = len(df)
         self.results: List[Dict] = []
@@ -300,18 +302,43 @@ class WalkForwardTrainer:
             make_env(train_df, 42, i) for i in range(self.config.n_envs)
         ])
 
-        # Create agent
+        # Create or load agent
         effective_batch = self.config.batch_size * self.config.n_envs
-        agent = TradingAgent(
-            env=train_envs,
-            algorithm="PPO",
-            feature_extractor="lstm",
-            learning_rate=3e-4,
-            batch_size=effective_batch,
-            n_steps=self.config.n_steps,
-            tensorboard_log=tensorboard_log,
-            seed=42,
-        )
+
+        if self.resume_path is not None and fold == 0:
+            # Resume from existing model on first fold
+            logger.info(f"Resuming from {self.resume_path}")
+            resume_model = self.resume_path
+            if self.resume_path.is_dir():
+                if (self.resume_path / "final_model.zip").exists():
+                    resume_model = self.resume_path / "final_model.zip"
+                elif (self.resume_path / "best_model_overall.zip").exists():
+                    resume_model = self.resume_path / "best_model_overall.zip"
+
+            agent = TradingAgent.from_pretrained(
+                path=resume_model,
+                env=train_envs,
+                algorithm="PPO",
+                feature_extractor="lstm",
+                learning_rate=3e-4,
+                batch_size=effective_batch,
+                n_steps=self.config.n_steps,
+                tensorboard_log=tensorboard_log,
+                seed=42,
+            )
+            logger.info("Model loaded successfully, continuing training")
+        else:
+            # Create new agent
+            agent = TradingAgent(
+                env=train_envs,
+                algorithm="PPO",
+                feature_extractor="lstm",
+                learning_rate=3e-4,
+                batch_size=effective_batch,
+                n_steps=self.config.n_steps,
+                tensorboard_log=tensorboard_log,
+                seed=42,
+            )
 
         # Training loop with periodic evaluation
         fold_dir = self.output_dir / f"fold_{fold}"
@@ -447,6 +474,7 @@ def main():
     parser.add_argument("--roll-step-pct", type=float, default=0.10, help="Roll forward step percentage")
     parser.add_argument("--fixed-sl-ticks", type=float, default=200.0, help="Fixed stop loss ticks")
     parser.add_argument("--tensorboard", action="store_true", help="Enable TensorBoard")
+    parser.add_argument("--resume", type=str, default=None, help="Path to model directory to resume from")
 
     args = parser.parse_args()
 
@@ -488,12 +516,14 @@ def main():
     tensorboard_log = str(output_dir / "tensorboard") if args.tensorboard else None
 
     # Run walk-forward training
+    resume_path = Path(args.resume) if args.resume else None
     trainer = WalkForwardTrainer(
         df=df,
         feature_columns=feature_columns,
         config=config,
         output_dir=output_dir,
         fixed_sl_ticks=args.fixed_sl_ticks,
+        resume_path=resume_path,
     )
 
     results = trainer.run(
