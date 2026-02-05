@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 class TradingCallback(BaseCallback):
     """
     Custom callback for tracking trading-specific metrics during training.
+
+    Metrics corrections applied:
+    - profit_factor: sum(gross_profit) / abs(sum(gross_loss)) - NOT averaged
+    - win_rate: total_winning_trades / total_trades - NOT averaged
+    - trade_frequency: trades_per_day, trades_per_1000_bars, avg_holding_bars
     """
 
     def __init__(
@@ -32,13 +37,19 @@ class TradingCallback(BaseCallback):
         super().__init__(verbose)
         self.log_freq = log_freq
 
-        # Tracking variables
+        # Episode-level tracking
         self.episode_rewards: List[float] = []
         self.episode_lengths: List[int] = []
-        self.episode_trades: List[int] = []
         self.episode_profits: List[float] = []
-        self.episode_win_rates: List[float] = []
 
+        # Aggregate trade tracking (for correct PF and WR calculation)
+        self.total_gross_profit = 0.0
+        self.total_gross_loss = 0.0
+        self.total_winning_trades = 0
+        self.total_trades = 0
+        self.total_bars = 0
+
+        # Per-env tracking
         self.current_episode_reward = 0
         self.current_episode_length = 0
         self.n_episodes = 0
@@ -47,9 +58,21 @@ class TradingCallback(BaseCallback):
         """Called before the first rollout starts."""
         self.episode_rewards = []
         self.episode_lengths = []
-        self.episode_trades = []
         self.episode_profits = []
-        self.episode_win_rates = []
+
+        # Reset aggregate tracking
+        self.total_gross_profit = 0.0
+        self.total_gross_loss = 0.0
+        self.total_winning_trades = 0
+        self.total_trades = 0
+        self.total_bars = 0
+
+        # Recent window tracking (for logging intervals)
+        self._recent_gross_profit = 0.0
+        self._recent_gross_loss = 0.0
+        self._recent_winning_trades = 0
+        self._recent_trades = 0
+        self._recent_bars = 0
 
         # Initialize per-env tracking for parallel environments
         n_envs = self.training_env.num_envs if hasattr(self.training_env, 'num_envs') else 1
@@ -82,14 +105,31 @@ class TradingCallback(BaseCallback):
 
                 # Get trading-specific info
                 info = infos[i]
-                self.episode_trades.append(info.get("total_trades", 0))
-                self.episode_profits.append(info.get("realized_pnl", 0))
 
-                # Track win rate
-                total_trades = info.get("total_trades", 0)
-                if total_trades > 0:
-                    win_rate = info.get("win_rate", 0.5)
-                    self.episode_win_rates.append(win_rate)
+                # Episode profit
+                realized_pnl = info.get("realized_pnl", 0)
+                self.episode_profits.append(realized_pnl)
+
+                # Aggregate trade stats from info
+                ep_trades = info.get("total_trades", 0)
+                ep_gross_profit = info.get("gross_profit", 0)
+                ep_gross_loss = info.get("gross_loss", 0)
+                ep_winning_trades = info.get("winning_trades", 0)
+                ep_bars = self._env_lengths[i]
+
+                # Update totals
+                self.total_trades += ep_trades
+                self.total_gross_profit += ep_gross_profit
+                self.total_gross_loss += ep_gross_loss
+                self.total_winning_trades += ep_winning_trades
+                self.total_bars += ep_bars
+
+                # Update recent window
+                self._recent_trades += ep_trades
+                self._recent_gross_profit += ep_gross_profit
+                self._recent_gross_loss += ep_gross_loss
+                self._recent_winning_trades += ep_winning_trades
+                self._recent_bars += ep_bars
 
                 self.n_episodes += 1
 
@@ -104,38 +144,67 @@ class TradingCallback(BaseCallback):
         return True
 
     def _log_metrics(self) -> None:
-        """Log training metrics."""
+        """Log training metrics with corrected calculations."""
         if len(self.episode_rewards) < self.log_freq:
             return
 
-        # Get recent episodes
+        # Get recent episodes for reward/profit
         recent_rewards = self.episode_rewards[-self.log_freq:]
         recent_profits = self.episode_profits[-self.log_freq:]
-        recent_trades = self.episode_trades[-self.log_freq:]
-        recent_win_rates = self.episode_win_rates[-self.log_freq:] if self.episode_win_rates else []
 
-        # Calculate metrics
+        # === REWARD METRICS ===
         mean_reward = np.mean(recent_rewards)
         std_reward = np.std(recent_rewards)
         mean_profit = np.mean(recent_profits)
         total_profit = np.sum(recent_profits)
-        mean_trades = np.mean(recent_trades)
-        mean_win_rate = np.mean(recent_win_rates) * 100 if recent_win_rates else 0
 
-        # Calculate profit factor from recent profits
-        wins = [p for p in recent_profits if p > 0]
-        losses = [abs(p) for p in recent_profits if p < 0]
-        profit_factor = sum(wins) / sum(losses) if losses and sum(losses) > 0 else 0
+        # === PROFIT FACTOR (aggregated, not averaged) ===
+        # Formula: sum(gross_profit) / abs(sum(gross_loss))
+        if self._recent_gross_loss != 0:
+            profit_factor = self._recent_gross_profit / abs(self._recent_gross_loss)
+        else:
+            profit_factor = self._recent_gross_profit if self._recent_gross_profit > 0 else 0
 
-        # Log to tensorboard if available
+        # === WIN RATE (aggregated, not averaged) ===
+        # Formula: winning_trades / total_trades
+        if self._recent_trades > 0:
+            win_rate = (self._recent_winning_trades / self._recent_trades) * 100
+        else:
+            win_rate = 0
+
+        # === TRADE FREQUENCY METRICS ===
+        mean_trades = self._recent_trades / self.log_freq if self.log_freq > 0 else 0
+
+        # Trades per day (assuming 78 bars per RTH day for 5-min bars)
+        bars_per_day = 78
+        episode_days = self._recent_bars / bars_per_day if bars_per_day > 0 else 1
+        trades_per_day = self._recent_trades / max(episode_days, 1)
+
+        # Trades per 1000 bars
+        trades_per_1000_bars = (self._recent_trades / max(self._recent_bars, 1)) * 1000
+
+        # Average holding bars
+        avg_holding_bars = self._recent_bars / max(self._recent_trades, 1)
+
+        # === LOG TO TENSORBOARD ===
         if self.logger is not None:
+            # Reward metrics
             self.logger.record("trading/mean_reward", mean_reward)
             self.logger.record("trading/std_reward", std_reward)
             self.logger.record("trading/mean_profit", mean_profit)
             self.logger.record("trading/total_profit", total_profit)
-            self.logger.record("trading/mean_trades", mean_trades)
-            self.logger.record("trading/win_rate", mean_win_rate)
+
+            # Corrected metrics
             self.logger.record("trading/profit_factor", profit_factor)
+            self.logger.record("trading/win_rate", win_rate)
+
+            # Trade frequency metrics
+            self.logger.record("trading/mean_trades", mean_trades)
+            self.logger.record("trading/trades_per_day", trades_per_day)
+            self.logger.record("trading/trades_per_1000_bars", trades_per_1000_bars)
+            self.logger.record("trading/avg_holding_bars", avg_holding_bars)
+
+            # Episode count
             self.logger.record("trading/n_episodes", self.n_episodes)
 
         if self.verbose > 0:
@@ -144,17 +213,31 @@ class TradingCallback(BaseCallback):
                 f"Reward: {mean_reward:.2f} | "
                 f"Profit: ${mean_profit:.2f} | "
                 f"Trades: {mean_trades:.1f} | "
-                f"WinRate: {mean_win_rate:.1f}% | "
-                f"PF: {profit_factor:.2f}"
+                f"WinRate: {win_rate:.1f}% | "
+                f"PF: {profit_factor:.2f} | "
+                f"Trades/Day: {trades_per_day:.1f}"
             )
+
+        # Reset recent window tracking
+        self._recent_gross_profit = 0.0
+        self._recent_gross_loss = 0.0
+        self._recent_winning_trades = 0
+        self._recent_trades = 0
+        self._recent_bars = 0
 
     def _on_training_end(self) -> None:
         """Called at the end of training."""
         if len(self.episode_rewards) > 0:
+            # Final aggregated stats
+            final_pf = self.total_gross_profit / abs(self.total_gross_loss) if self.total_gross_loss != 0 else 0
+            final_wr = (self.total_winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0
+
             logger.info(
                 f"Training completed | "
                 f"Total Episodes: {self.n_episodes} | "
-                f"Final Mean Reward: {np.mean(self.episode_rewards[-100:]):.2f} | "
+                f"Total Trades: {self.total_trades} | "
+                f"Final PF: {final_pf:.2f} | "
+                f"Final WR: {final_wr:.1f}% | "
                 f"Final Mean Profit: ${np.mean(self.episode_profits[-100:]):.2f}"
             )
 
@@ -164,14 +247,13 @@ class TradingCallback(BaseCallback):
             "episode": range(len(self.episode_rewards)),
             "reward": self.episode_rewards,
             "length": self.episode_lengths,
-            "trades": self.episode_trades,
             "profit": self.episode_profits,
         })
 
 
 class EvaluationCallback(EvalCallback):
     """
-    Extended evaluation callback with trading-specific metrics.
+    Extended evaluation callback with trading-specific metrics and progress bar.
     """
 
     def __init__(
@@ -216,47 +298,91 @@ class EvaluationCallback(EvalCallback):
         self.best_sharpe = -np.inf
         self.eval_history: List[Dict] = []
 
+    def _evaluate_with_progress(self) -> tuple:
+        """Run evaluation with progress bar."""
+        from tqdm import tqdm
+
+        episode_rewards = []
+        episode_lengths = []
+
+        obs = self.eval_env.reset()
+        n_envs = self.eval_env.num_envs
+        episode_counts = np.zeros(n_envs, dtype=int)
+        current_rewards = np.zeros(n_envs)
+        current_lengths = np.zeros(n_envs, dtype=int)
+
+        pbar = tqdm(total=self.n_eval_episodes, desc="Evaluating", unit="ep", leave=False)
+
+        while episode_counts.sum() < self.n_eval_episodes:
+            actions, _ = self.model.predict(obs, deterministic=self.deterministic)
+            obs, rewards, dones, infos = self.eval_env.step(actions)
+
+            current_rewards += rewards
+            current_lengths += 1
+
+            for i, done in enumerate(dones):
+                if done and episode_counts[i] < self.n_eval_episodes:
+                    episode_rewards.append(current_rewards[i])
+                    episode_lengths.append(current_lengths[i])
+                    episode_counts[i] += 1
+                    pbar.update(1)
+                    pbar.set_postfix({"reward": f"{current_rewards[i]:.2f}"})
+                    current_rewards[i] = 0
+                    current_lengths[i] = 0
+
+        pbar.close()
+        return episode_rewards, episode_lengths
+
     def _on_step(self) -> bool:
         """Called after each step."""
-        result = super()._on_step()
+        continue_training = True
 
-        # Check for early stopping
-        if self.n_calls % self.eval_freq == 0 and len(self.evaluations_results) > 0:
-            # Calculate Sharpe ratio from recent evaluations
-            recent_returns = self.evaluations_results[-1]
-            if len(recent_returns) > 0:
-                mean_return = np.mean(recent_returns)
-                std_return = np.std(recent_returns) + 1e-8
-                sharpe = mean_return / std_return
+        if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
+            # Run evaluation with progress bar
+            logger.info(f"Starting evaluation at timestep {self.num_timesteps}...")
+            episode_rewards, episode_lengths = self._evaluate_with_progress()
 
-                # Track history
+            mean_reward = np.mean(episode_rewards)
+            std_reward = np.std(episode_rewards)
+            self.last_mean_reward = mean_reward
+
+            # Store results
+            self.evaluations_results.append(episode_rewards)
+            self.evaluations_timesteps.append(self.num_timesteps)
+            self.evaluations_length.append(episode_lengths)
+
+            # Log results
+            if self.verbose >= 1:
+                logger.info(f"Eval: mean_reward={mean_reward:.2f} +/- {std_reward:.2f}, episodes={len(episode_rewards)}")
+
+            # Save best model
+            if mean_reward > self.best_mean_reward:
+                self.best_mean_reward = mean_reward
+                if self.best_model_save_path is not None:
+                    self.model.save(f"{self.best_model_save_path}/best_model")
+                    logger.info(f"New best model saved with reward: {mean_reward:.2f}")
+
+            # Continue with Sharpe tracking
+            if len(episode_rewards) > 0:
+                sharpe = mean_reward / (std_reward + 1e-8)
                 self.eval_history.append({
                     "timestep": self.num_timesteps,
-                    "mean_return": mean_return,
-                    "std_return": std_return,
+                    "mean_return": mean_reward,
+                    "std_return": std_reward,
                     "sharpe": sharpe,
                 })
 
-                # Check for improvement
                 if sharpe > self.best_sharpe + self.min_improvement:
                     self.best_sharpe = sharpe
                     self.no_improvement_count = 0
-
-                    if self.verbose > 0:
-                        logger.info(f"New best Sharpe ratio: {sharpe:.3f}")
                 else:
                     self.no_improvement_count += 1
 
-                # Early stopping check
                 if self.no_improvement_count >= self.early_stopping_patience:
-                    if self.verbose > 0:
-                        logger.info(
-                            f"Early stopping triggered after {self.no_improvement_count} "
-                            f"evaluations without improvement"
-                        )
+                    logger.info(f"Early stopping after {self.no_improvement_count} evals without improvement")
                     return False
 
-        return result
+        return continue_training
 
     def get_eval_history(self) -> pd.DataFrame:
         """Get evaluation history as DataFrame."""

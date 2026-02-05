@@ -122,10 +122,12 @@ python scripts/train.py \
 
 Options:
 - `--algorithm`: PPO or A2C
-- `--feature-extractor`: lstm or attention
-- `--reward-type`: pnl, sharpe, sortino, risk_adjusted
+- `--feature-extractor`: lstm, gru, attention
+- `--fixed-sl-ticks`: Stop loss in ticks (default 200)
 - `--walk-forward`: Use walk-forward validation
 - `--tensorboard`: Enable TensorBoard logging
+
+Note: Uses sparse reward system (rewards only on trade completion).
 
 ### 3. Backtest
 
@@ -254,7 +256,7 @@ env = TradingEnv(
     feature_columns=['rsi', 'macd', ...],
     initial_balance=10000.0,
     lookback_window=50,
-    reward_type='sharpe',
+    stop_loss_ticks=200.0,
 )
 
 obs, info = env.reset()

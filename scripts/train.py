@@ -78,7 +78,7 @@ def main():
     parser.add_argument(
         "--feature-extractor",
         type=str,
-        default="gru",
+        default="lstm",
         choices=["lstm", "gru", "residual_lstm", "attention"],
         help="Feature extractor type",
     )
@@ -93,13 +93,6 @@ def main():
         type=int,
         default=512,
         help="Batch size",
-    )
-    parser.add_argument(
-        "--reward-type",
-        type=str,
-        default="composite",
-        choices=["pnl", "sharpe", "sortino", "risk_adjusted", "profit_factor", "composite"],
-        help="Reward function type",
     )
     parser.add_argument(
         "--walk-forward",
@@ -136,10 +129,10 @@ def main():
         help="Multiply batch size for faster training",
     )
     parser.add_argument(
-        "--sl-options",
-        type=str,
-        default="80,120,160,200",
-        help="Comma-separated SL options in ticks (agent learns to choose)",
+        "--fixed-sl-ticks",
+        type=float,
+        default=200.0,
+        help="Fixed stop loss in ticks (default 200 = $100)",
     )
     parser.add_argument(
         "--resume",
@@ -150,8 +143,8 @@ def main():
     parser.add_argument(
         "--n-steps",
         type=int,
-        default=4096,
-        help="Steps per environment per update (PPO)",
+        default=8192,
+        help="Steps per environment per update (PPO). Larger = more stable learning.",
     )
     parser.add_argument(
         "--normalize",
@@ -180,11 +173,12 @@ def main():
     logger.info(f"Timesteps: {args.timesteps}")
     logger.info(f"Learning rate: {args.learning_rate}")
     logger.info(f"Batch size: {args.batch_size}")
-    logger.info(f"Reward type: {args.reward_type}")
+    logger.info(f"N-steps: {args.n_steps}")
+    logger.info("Reward type: sparse (PnL on trade completion)")
 
-    # Parse SL options
-    sl_options = [float(x) for x in args.sl_options.split(",")]
-    logger.info(f"SL options (ticks): {sl_options}")
+    # Fixed SL
+    fixed_sl_ticks = args.fixed_sl_ticks
+    logger.info(f"Fixed SL (ticks): {fixed_sl_ticks}")
     logger.info(f"Output: {output_dir}")
     logger.info("=" * 50)
 
@@ -235,15 +229,14 @@ def main():
         from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize
         from stable_baselines3.common.monitor import Monitor
 
-        def make_env(df, feature_columns, reward_type, sl_options, seed, rank):
+        def make_env(df, feature_columns, fixed_sl_ticks, seed, rank):
             """Create a single environment instance."""
             def _init():
                 env = TradingEnv(
                     df=df,
                     feature_columns=feature_columns,
-                    reward_type=reward_type,
                     lookback_window=settings.LOOKBACK_WINDOW,
-                    sl_options=sl_options,
+                    stop_loss_ticks=fixed_sl_ticks,
                 )
                 env.reset(seed=seed + rank)
                 return Monitor(env)
@@ -255,22 +248,23 @@ def main():
         # Create parallel training environments
         # Default to DummyVecEnv for fewer environments or Mac
         train_envs = DummyVecEnv([
-            make_env(train_df, feature_columns, args.reward_type, sl_options, args.seed, i)
+            make_env(train_df, feature_columns, fixed_sl_ticks, args.seed, i)
             for i in range(n_envs)
         ])
         
-        # Apply normalization if requested
-        if args.normalize:
-            train_envs = VecNormalize(train_envs, norm_obs=True, norm_reward=False, clip_obs=10.0)
-
-        # Single validation environment
+        # Single validation environment (create before normalization)
         val_env = TradingEnv(
             df=val_df,
             feature_columns=feature_columns,
-            reward_type=args.reward_type,
             lookback_window=settings.LOOKBACK_WINDOW,
-            sl_options=sl_options,
+            stop_loss_ticks=fixed_sl_ticks,
         )
+        val_vec_env = DummyVecEnv([lambda: Monitor(val_env)])
+
+        # Apply normalization if requested
+        if args.normalize:
+            train_envs = VecNormalize(train_envs, norm_obs=True, norm_reward=False, clip_obs=10.0)
+            val_vec_env = VecNormalize(val_vec_env, norm_obs=True, norm_reward=False, clip_obs=10.0, training=False)
 
         # Create agent with parallel envs and larger batch
         effective_batch = args.batch_size * args.batch_multiplier * n_envs
@@ -292,6 +286,7 @@ def main():
                 feature_extractor=args.feature_extractor,
                 learning_rate=args.learning_rate,
                 batch_size=effective_batch,
+                n_steps=args.n_steps,
                 tensorboard_log=tensorboard_log,
                 seed=args.seed,
             )
@@ -303,6 +298,7 @@ def main():
                 feature_extractor=args.feature_extractor,
                 learning_rate=args.learning_rate,
                 batch_size=effective_batch,
+                n_steps=args.n_steps,
                 tensorboard_log=tensorboard_log,
                 seed=args.seed,
             )
@@ -311,8 +307,9 @@ def main():
         logger.info("Starting training...")
         agent.train(
             total_timesteps=args.timesteps,
-            eval_env=val_env,
-            eval_freq=max(10000, args.timesteps // 20),  # Evaluate ~20 times during training
+            eval_env=val_vec_env,
+            eval_freq=args.timesteps // 5,  # Evaluate 5 times during training
+            n_eval_episodes=1,  # Just 1 episode per eval (~5k steps)
             save_freq=args.timesteps // 5,
             save_path=output_dir,
             log_interval=5,  # Log trading metrics every 5 episodes
@@ -330,12 +327,11 @@ def main():
         test_env = TradingEnv(
             df=test_df,
             feature_columns=feature_columns,
-            reward_type=args.reward_type,
             lookback_window=settings.LOOKBACK_WINDOW,
-            sl_options=sl_options,
+            stop_loss_ticks=fixed_sl_ticks,
         )
 
-        eval_results = agent.evaluate(test_env, n_episodes=10)
+        eval_results = agent.evaluate(test_env, n_episodes=1)  # Reduced - each episode is ~5k steps
 
         logger.info("=" * 50)
         logger.info("TEST RESULTS")
@@ -361,9 +357,9 @@ def main():
     training_config = {
         "algorithm": args.algorithm,
         "feature_extractor": args.feature_extractor,
-        "reward_type": args.reward_type,
+        "reward_type": "sparse",
         "lookback_window": settings.LOOKBACK_WINDOW,
-        "sl_options": sl_options,
+        "fixed_sl_ticks": fixed_sl_ticks,
     }
     with open(output_dir / "training_config.json", "w") as f:
         json.dump(training_config, f, indent=2)

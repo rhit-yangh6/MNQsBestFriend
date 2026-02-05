@@ -215,51 +215,62 @@ class TestTradingEnv:
 
 
 class TestRewardCalculator:
-    """Tests for RewardCalculator class."""
+    """Tests for RewardCalculator class (sparse rewards)."""
 
-    def test_pnl_reward_positive(self):
-        """Test positive P&L reward."""
-        calc = RewardCalculator(reward_type="pnl")
-        reward = calc.calculate_trade_reward(
-            pnl=100.0,
-            position=1,
-            time_in_position=10,
+    def test_winning_trade_reward(self):
+        """Test positive reward for winning trade."""
+        calc = RewardCalculator()
+        calc.reset(10000.0)
+        reward = calc.calculate_step_reward(
+            current_equity=10100.0,
+            position=0,
+            trade_just_closed=True,
+            trade_pnl=100.0,
+            bars_held=10,
         )
         assert reward > 0
 
-    def test_pnl_reward_negative(self):
-        """Test negative P&L reward."""
-        calc = RewardCalculator(reward_type="pnl")
-        reward = calc.calculate_trade_reward(
-            pnl=-100.0,
-            position=1,
-            time_in_position=10,
+    def test_losing_trade_reward(self):
+        """Test negative reward for losing trade."""
+        calc = RewardCalculator()
+        calc.reset(10000.0)
+        reward = calc.calculate_step_reward(
+            current_equity=9900.0,
+            position=0,
+            trade_just_closed=True,
+            trade_pnl=-100.0,
+            bars_held=10,
         )
         assert reward < 0
 
-    def test_asymmetric_reward(self):
-        """Test asymmetric reward scaling."""
-        calc = RewardCalculator(
-            reward_type="asymmetric",
-            profit_scale=1.0,
-            loss_scale=1.5,
+    def test_asymmetric_penalty(self):
+        """Test losses penalized more than wins rewarded."""
+        calc = RewardCalculator()
+        calc.reset(10000.0)
+
+        win_reward = calc.calculate_step_reward(
+            current_equity=10100.0, position=0, trade_just_closed=True, trade_pnl=100.0, bars_held=5
+        )
+        calc.reset(10000.0)
+        loss_reward = calc.calculate_step_reward(
+            current_equity=9900.0, position=0, trade_just_closed=True, trade_pnl=-100.0, bars_held=5
         )
 
-        win_reward = calc.calculate_trade_reward(pnl=100.0, position=1, time_in_position=5)
-        loss_reward = calc.calculate_trade_reward(pnl=-100.0, position=1, time_in_position=5)
-
-        # Loss should be penalized more
+        # Loss should be penalized more (1.5x)
         assert abs(loss_reward) > abs(win_reward)
 
-    def test_holding_reward_flat(self):
-        """Test holding reward when flat."""
+    def test_no_reward_without_trade(self):
+        """Test no reward when no trade closes."""
         calc = RewardCalculator()
-        reward = calc.calculate_holding_reward(
-            position=0,
-            unrealized_pnl=0,
-            time_in_position=0,
+        calc.reset(10000.0)
+        reward = calc.calculate_step_reward(
+            current_equity=10000.0,
+            position=1,
+            trade_just_closed=False,
+            trade_pnl=0.0,
+            bars_held=0,
         )
-        assert reward == 0
+        assert reward == 0.0
 
 
 class TestPositionSizer:

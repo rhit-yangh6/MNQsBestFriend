@@ -46,7 +46,7 @@ def load_model_and_config(model_dir: Path):
         # Default config for backwards compatibility
         training_config = {
             "lookback_window": settings.LOOKBACK_WINDOW,
-            "sl_options": [80.0, 120.0, 160.0, 200.0],
+            "fixed_sl_ticks": 200.0,
         }
 
     return feature_columns, preprocessor, training_config
@@ -156,7 +156,7 @@ def main():
 
     # Get config values
     lookback_window = training_config.get("lookback_window", settings.LOOKBACK_WINDOW)
-    sl_options = training_config.get("sl_options", [80.0, 120.0, 160.0, 200.0])
+    fixed_sl_ticks = training_config.get("fixed_sl_ticks", 120.0)
 
     # Load model
     logger.info("Loading model...")
@@ -164,7 +164,7 @@ def main():
     dummy_env = TradingEnv(
         df=df.iloc[:lookback_window + 100].reset_index(drop=True),
         feature_columns=available_features,
-        sl_options=sl_options,
+        fixed_sl_ticks=fixed_sl_ticks,
     )
 
     agent = TradingAgent(algorithm="PPO")
@@ -185,7 +185,7 @@ def main():
         feature_columns=available_features,
         lookback_window=lookback_window,
         deterministic=args.deterministic,
-        sl_options=sl_options,
+        fixed_sl_ticks=fixed_sl_ticks,
     )
 
     # Print results

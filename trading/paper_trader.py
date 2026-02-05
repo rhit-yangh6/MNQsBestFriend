@@ -36,12 +36,13 @@ class PaperTrader:
         model,
         feature_columns: List[str],
         preprocessor=None,
-        sl_options: List[float] = None,
+        fixed_sl_ticks: float = 200.0,
         lookback_window: int = 50,
         max_position: int = 1,
         max_daily_loss: float = 500.0,
         log_dir: str = "logs/paper_trading",
         use_live_data: bool = True,  # Connect to live for real-time data
+        sl_options: List[float] = None,  # Deprecated - kept for compatibility
     ):
         """
         Initialize paper trader.
@@ -50,17 +51,18 @@ class PaperTrader:
             model: Trained trading model
             feature_columns: Feature columns for model input
             preprocessor: Data preprocessor with fitted scaler
-            sl_options: SL options in ticks (for learnable SL)
+            fixed_sl_ticks: Fixed stop loss in ticks (default 120)
             lookback_window: Lookback window for state
             max_position: Maximum position size
             max_daily_loss: Maximum daily loss limit
             log_dir: Directory for trade logs
             use_live_data: Connect to live port for real-time data (no delay)
+            sl_options: Deprecated - kept for compatibility
         """
         self.model = model
         self.feature_columns = feature_columns
         self.preprocessor = preprocessor
-        self.sl_options = sl_options or [80.0, 120.0, 160.0, 200.0]
+        self.fixed_sl_ticks = fixed_sl_ticks
         self.lookback_window = lookback_window
         self.max_position = max_position
         self.max_daily_loss = max_daily_loss
@@ -85,8 +87,7 @@ class PaperTrader:
         self.position = 0
         self.entry_price = 0.0
         self.entry_time: Optional[datetime] = None
-        self.current_sl_ticks = 0.0
-        self.current_sl_level = 0
+        self.current_sl_ticks = fixed_sl_ticks
         self.stop_loss_price = 0.0
         self.daily_pnl = 0.0
         self.total_pnl = 0.0
@@ -183,7 +184,7 @@ class PaperTrader:
         with open(csv_path, 'a', newline='') as f:
             fieldnames = [
                 'timestamp', 'action', 'side', 'entry_price', 'exit_price',
-                'sl_level', 'sl_ticks', 'stop_loss_price', 'pnl', 'commission',
+                'sl_ticks', 'stop_loss_price', 'pnl', 'commission',
                 'duration_bars', 'reason', 'position_after', 'daily_pnl', 'total_pnl'
             ]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -221,13 +222,8 @@ class PaperTrader:
             f.write(f"Daily P&L:       ${self.daily_pnl:.2f}\n")
             f.write(f"Total P&L:       ${self.total_pnl:.2f}\n")
             f.write(f"Avg P&L/Trade:   ${avg_pnl:.2f}\n")
+            f.write(f"Fixed SL:        {self.fixed_sl_ticks} ticks\n")
             f.write("=" * 50 + "\n")
-
-            # SL level distribution
-            if hasattr(self, '_sl_level_counts'):
-                f.write("\nSL Level Distribution:\n")
-                for level, count in self._sl_level_counts.items():
-                    f.write(f"  Level {level}: {count} trades\n")
 
         logger.info(f"Saved daily summary to {summary_path}")
 
@@ -382,10 +378,10 @@ class PaperTrader:
             return
 
         # Get trading decision
-        action_type, sl_level = self._get_model_action()
+        action_type = self._get_model_action()
 
         # Execute action
-        self._execute_action(action_type, sl_level, current_price)
+        self._execute_action(action_type, current_price)
 
     def _update_feature_buffer(self) -> None:
         """Update the feature DataFrame from bar buffer."""
@@ -410,31 +406,29 @@ class PaperTrader:
         except Exception as e:
             logger.error(f"Error computing features: {e}")
 
-    def _get_model_action(self) -> tuple:
-        """Get action from trained model (MultiDiscrete: action_type, sl_level)."""
+    def _get_model_action(self) -> int:
+        """Get action from trained model (Discrete: action_type only)."""
         # Prepare observation
         obs = self._prepare_observation()
 
         # Get model prediction
         action, _ = self.model.predict(obs, deterministic=True)
 
-        # Parse MultiDiscrete action
-        if isinstance(action, np.ndarray) and len(action) >= 2:
-            action_type = int(action[0])
-            sl_level = int(action[1])
+        # Parse Discrete action (single int or 0-d array)
+        if isinstance(action, np.ndarray):
+            action_type = int(action.item()) if action.ndim == 0 else int(action[0])
         else:
-            action_type = int(action[0]) if isinstance(action, np.ndarray) else int(action)
-            sl_level = 1  # Default medium
+            action_type = int(action)
 
-        return action_type, sl_level
+        return action_type
 
     def _prepare_observation(self) -> Dict[str, np.ndarray]:
-        """Prepare observation for model input (7-element position_info)."""
+        """Prepare observation for model input (4-element position_info)."""
         # Build DataFrame from buffer
         if self.df_buffer is None or len(self.df_buffer) < self.lookback_window:
             # Not enough data yet, return zeros
             market_features = np.zeros((self.lookback_window, len(self.feature_columns)), dtype=np.float32)
-            position_info = np.zeros(7, dtype=np.float32)
+            position_info = np.zeros(4, dtype=np.float32)
             return {"market_features": market_features, "position_info": position_info}
 
         # Get last lookback_window rows
@@ -444,7 +438,7 @@ class PaperTrader:
         available_features = [f for f in self.feature_columns if f in df.columns]
         market_features = df[available_features].values.astype(np.float32)
 
-        # Calculate position info (7 elements)
+        # Calculate position info
         unrealized_pnl = self._calculate_unrealized_pnl()
         time_in_position = 0
         if self.entry_time:
@@ -452,33 +446,17 @@ class PaperTrader:
                 next((b for b in self.bar_buffer if b.get('timestamp') == self.entry_time), self.bar_buffer[0])
             )
 
-        # Balance ratio (assuming $10k initial)
+        # Equity ratio (assuming $10k initial)
         initial_balance = 10000.0
         current_equity = initial_balance + self.total_pnl + unrealized_pnl
-        balance_ratio = current_equity / initial_balance
+        equity_ratio = current_equity / initial_balance
 
-        # SL distance ratio
-        if self.position != 0 and self.current_sl_ticks > 0:
-            sl_points = self.current_sl_ticks * settings.TICK_SIZE
-            max_loss = sl_points * settings.POINT_VALUE
-            pnl_to_sl_ratio = (unrealized_pnl + max_loss) / max_loss if max_loss > 0 else 1.0
-        else:
-            pnl_to_sl_ratio = 1.0
-
-        # Max P&L ratio (simplified - would need tracking)
-        max_pnl_ratio = 1.0
-
-        # Normalized SL level
-        sl_level_norm = self.current_sl_level / max(1, len(self.sl_options) - 1) if self.position != 0 else 0.5
-
+        # 4-element position_info (matches current model)
         position_info = np.array([
-            self.position,
-            unrealized_pnl / initial_balance,
-            min(time_in_position / 100, 1.0),
-            balance_ratio,
-            pnl_to_sl_ratio,
-            max_pnl_ratio,
-            sl_level_norm,
+            float(self.position),
+            unrealized_pnl / 100.0,  # Normalize ~$100 typical
+            min(time_in_position / 50.0, 2.0),  # Normalize time
+            equity_ratio,
         ], dtype=np.float32)
 
         return {
@@ -486,13 +464,12 @@ class PaperTrader:
             "position_info": position_info,
         }
 
-    def _execute_action(self, action_type: int, sl_level: int, current_price: float) -> None:
+    def _execute_action(self, action_type: int, current_price: float) -> None:
         """
         Execute trading action (SIMULATED - no real orders).
 
         Args:
             action_type: 0=HOLD, 1=BUY, 2=SELL, 3=CLOSE
-            sl_level: SL level index
             current_price: Current market price
         """
         if action_type == 0:  # HOLD
@@ -505,13 +482,13 @@ class PaperTrader:
             if self.position == -1:
                 self._close_position(current_price, "Signal reversal")
             if self.position <= 0:
-                self._open_position(OrderSide.BUY, current_price, sl_level)
+                self._open_position(OrderSide.BUY, current_price)
 
         elif action_type == 2:  # SELL
             if self.position == 1:
                 self._close_position(current_price, "Signal reversal")
             if self.position >= 0:
-                self._open_position(OrderSide.SELL, current_price, sl_level)
+                self._open_position(OrderSide.SELL, current_price)
 
         elif action_type == 3:  # CLOSE
             if self.position != 0:
@@ -533,17 +510,15 @@ class PaperTrader:
 
         return False
 
-    def _open_position(self, side: OrderSide, price: float, sl_level: int) -> None:
+    def _open_position(self, side: OrderSide, price: float) -> None:
         """Open a new position (SIMULATED)."""
         try:
             # Simulate fill with slippage
             slippage = settings.SLIPPAGE_TICKS * settings.TICK_SIZE
             fill_price = price + slippage if side == OrderSide.BUY else price - slippage
 
-            # Set SL based on chosen level
-            sl_level = min(sl_level, len(self.sl_options) - 1)
-            self.current_sl_level = sl_level
-            self.current_sl_ticks = self.sl_options[sl_level]
+            # Set fixed SL
+            self.current_sl_ticks = self.fixed_sl_ticks
             sl_points = self.current_sl_ticks * settings.TICK_SIZE
 
             # Calculate stop loss price
@@ -569,7 +544,6 @@ class PaperTrader:
                 'side': side.value,
                 'entry_price': fill_price,
                 'exit_price': None,
-                'sl_level': sl_level,
                 'sl_ticks': self.current_sl_ticks,
                 'stop_loss_price': self.stop_loss_price,
                 'pnl': None,
@@ -584,7 +558,7 @@ class PaperTrader:
 
             logger.info(
                 f"[SIM] Opened {side.value} at {fill_price:.2f}, "
-                f"SL={self.stop_loss_price:.2f} (level {sl_level}, {self.current_sl_ticks} ticks)"
+                f"SL={self.stop_loss_price:.2f} ({self.current_sl_ticks} ticks)"
             )
 
             if self.on_position_change:
@@ -634,7 +608,6 @@ class PaperTrader:
                 'side': 'LONG' if self.position > 0 else 'SHORT',
                 'entry_price': self.entry_price,
                 'exit_price': fill_price,
-                'sl_level': self.current_sl_level,
                 'sl_ticks': self.current_sl_ticks,
                 'stop_loss_price': self.stop_loss_price,
                 'pnl': pnl,
@@ -658,8 +631,7 @@ class PaperTrader:
             self.entry_price = 0.0
             self.entry_time = None
             self.stop_loss_price = 0.0
-            self.current_sl_ticks = 0.0
-            self.current_sl_level = 0
+            self.current_sl_ticks = self.fixed_sl_ticks
 
             # Callback
             if self.on_trade:

@@ -17,8 +17,7 @@ from ib_insync.order import Order as IBOrder
 
 from config.settings import settings
 from config.ib_config import ib_config
-from .order_manager import OrderManager, Order, OrderSide, OrderType, OrderStatus
-from env.position_sizer import PositionSizer
+from .order_manager import OrderManager, OrderSide
 from data.features import FeatureEngineer
 
 logger = logging.getLogger(__name__)
@@ -41,12 +40,11 @@ class LiveTrader:
         self,
         model,
         feature_columns: List[str],
+        preprocessor=None,
         lookback_window: int = 50,
         max_position: int = 1,
         max_daily_loss: float = 500.0,
-        risk_per_trade: float = 0.02,
-        use_stop_loss: bool = True,
-        stop_loss_atr_mult: float = 2.0,
+        fixed_sl_ticks: float = 200.0,
         log_dir: Optional[Path] = None,
     ):
         """
@@ -55,22 +53,20 @@ class LiveTrader:
         Args:
             model: Trained trading model
             feature_columns: Feature columns for model input
+            preprocessor: Data preprocessor with fitted scaler
             lookback_window: Lookback window for state
             max_position: Maximum position size
             max_daily_loss: Maximum daily loss in USD
-            risk_per_trade: Risk per trade as fraction of account
-            use_stop_loss: Whether to use automatic stop-loss
-            stop_loss_atr_mult: ATR multiplier for stop-loss
+            fixed_sl_ticks: Fixed stop loss in ticks (200 = $100)
             log_dir: Directory for trade logs
         """
         self.model = model
         self.feature_columns = feature_columns
+        self.preprocessor = preprocessor
         self.lookback_window = lookback_window
         self.max_position = max_position
         self.max_daily_loss = max_daily_loss
-        self.risk_per_trade = risk_per_trade
-        self.use_stop_loss = use_stop_loss
-        self.stop_loss_atr_mult = stop_loss_atr_mult
+        self.fixed_sl_ticks = fixed_sl_ticks
         self.log_dir = log_dir or settings.LOG_DIR
 
         # IBKR connection
@@ -79,11 +75,10 @@ class LiveTrader:
 
         # Components
         self.order_manager = OrderManager()
-        self.position_sizer = PositionSizer(
-            max_position=max_position,
-            risk_per_trade=risk_per_trade,
-        )
         self.feature_engineer = FeatureEngineer()
+
+        # SL order tracking
+        self.sl_order_id: Optional[int] = None
 
         # State
         self.position = 0
@@ -98,7 +93,6 @@ class LiveTrader:
         # Data buffers
         self.bar_buffer: List[Dict] = []
         self.tick_buffer: List[Dict] = []
-        self.current_atr = 0.0
 
         # Control
         self.running = False
@@ -366,27 +360,39 @@ class LiveTrader:
         return int(action)
 
     def _prepare_observation(self) -> Dict[str, np.ndarray]:
-        """Prepare observation for model."""
+        """Prepare observation for model (4-element position_info)."""
         df = pd.DataFrame(self.bar_buffer[-self.lookback_window:])
 
         # Calculate features
         df_with_features = self.feature_engineer.compute_all_features(df)
 
-        # Get features that exist in our columns
+        # Normalize if preprocessor available
         available_features = [f for f in self.feature_columns if f in df_with_features.columns]
+        if self.preprocessor is not None and available_features:
+            df_with_features[available_features] = self.preprocessor.transform(
+                df_with_features[available_features]
+            )
+
         market_features = df_with_features[available_features].values
 
-        # Update ATR
-        if "atr" in df_with_features.columns:
-            self.current_atr = df_with_features["atr"].iloc[-1]
+        # Calculate time in position
+        time_in_position = 0
+        if self.last_trade_time:
+            # Approximate bars since entry
+            time_in_position = len([b for b in self.bar_buffer
+                                   if b.get('timestamp', datetime.min) >= self.last_trade_time])
 
-        # Position info
+        # Position info (4 elements - matches current model)
         unrealized_pnl = self._calculate_unrealized_pnl()
+        initial_balance = 10000.0
+        current_equity = initial_balance + self.daily_pnl + unrealized_pnl
+        equity_ratio = current_equity / initial_balance
+
         position_info = np.array([
-            np.sign(self.position),
-            unrealized_pnl / max(self.account_value, 1),
-            0.0,  # Time in position
-            (self.account_value + unrealized_pnl) / self.daily_start_equity,
+            float(self.position),
+            unrealized_pnl / 100.0,  # Normalize ~$100 typical
+            min(time_in_position / 50.0, 2.0),  # Normalize time
+            equity_ratio,
         ], dtype=np.float32)
 
         return {
@@ -416,20 +422,11 @@ class LiveTrader:
                 self._close_position("Model close signal")
 
     def _open_position(self, side: OrderSide, price: float) -> None:
-        """Open a position with stop-loss."""
+        """Open a position with fixed stop-loss placed immediately after fill."""
         try:
-            # Calculate position size
-            stop_distance = self.current_atr * self.stop_loss_atr_mult if self.current_atr > 0 else 10.0
-            stop_price = price - stop_distance if side == OrderSide.BUY else price + stop_distance
+            size = self.max_position
 
-            size = self.position_sizer.calculate_size(
-                account_balance=self.account_value,
-                entry_price=price,
-                stop_loss_price=stop_price,
-                current_atr=self.current_atr,
-            )
-
-            # Create and submit order
+            # Create and submit market order
             action = "BUY" if side == OrderSide.BUY else "SELL"
             order = MarketOrder(action, size)
 
@@ -444,10 +441,15 @@ class LiveTrader:
                 self.entry_price = fill_price
                 self.last_trade_time = datetime.now()
 
-                # Calculate and set stop-loss
-                if self.use_stop_loss:
-                    self.stop_loss_price = stop_price
-                    self._place_stop_loss_order(stop_price, size, side)
+                # Calculate fixed stop-loss price
+                sl_points = self.fixed_sl_ticks * settings.TICK_SIZE
+                if side == OrderSide.BUY:
+                    self.stop_loss_price = fill_price - sl_points
+                else:
+                    self.stop_loss_price = fill_price + sl_points
+
+                # Place SL order IMMEDIATELY after fill
+                self._place_stop_loss_order(self.stop_loss_price, size, side)
 
                 # Log trade
                 self._log_trade({
@@ -455,15 +457,16 @@ class LiveTrader:
                     "side": side.value,
                     "price": fill_price,
                     "size": size,
+                    "sl_ticks": self.fixed_sl_ticks,
                     "stop_loss": self.stop_loss_price,
                     "timestamp": datetime.now().isoformat(),
                 })
 
                 logger.info(
                     f"Opened {side.value} {size} @ {fill_price:.2f}, "
-                    f"SL: {self.stop_loss_price:.2f}"
+                    f"SL @ {self.stop_loss_price:.2f} ({self.fixed_sl_ticks} ticks)"
                 )
-                self._send_alert("TRADE", f"Opened {side.value} {size} @ {fill_price:.2f}")
+                self._send_alert("TRADE", f"Opened {side.value} @ {fill_price:.2f}, SL @ {self.stop_loss_price:.2f}")
 
             else:
                 logger.warning(f"Order not filled: {trade.orderStatus.status}")
@@ -513,13 +516,11 @@ class LiveTrader:
                 logger.info(f"Closed position @ {fill_price:.2f}, P&L: ${pnl:.2f}, Reason: {reason}")
                 self._send_alert("TRADE", f"Closed @ {fill_price:.2f}, P&L: ${pnl:.2f}")
 
-                # Update position tracker
-                self.position_sizer.track_trade(pnl, pnl > 0)
-
                 # Reset state
                 self.position = 0
                 self.entry_price = 0.0
                 self.stop_loss_price = 0.0
+                self.sl_order_id = None
 
                 if self.on_trade:
                     self.on_trade({
@@ -541,24 +542,37 @@ class LiveTrader:
     def _place_stop_loss_order(
         self, stop_price: float, size: int, entry_side: OrderSide
     ) -> None:
-        """Place a stop-loss order."""
+        """Place a stop-loss order immediately after entry fill."""
         try:
             action = "SELL" if entry_side == OrderSide.BUY else "BUY"
             order = StopOrder(action, size, stop_price)
             order.transmit = True
+            order.outsideRth = True  # Allow execution outside regular hours
+            order.tif = 'GTC'  # Good till cancelled
 
             trade = self.ib.placeOrder(self.contract, order)
-            logger.info(f"Placed stop-loss order @ {stop_price:.2f}")
+            self.sl_order_id = trade.order.orderId
+
+            logger.info(f"Placed SL order #{self.sl_order_id}: {action} @ {stop_price:.2f}")
 
         except Exception as e:
             logger.error(f"Error placing stop-loss: {e}")
+            self._send_alert("ERROR", f"Failed to place SL order: {e}")
 
     def _cancel_stop_loss_orders(self) -> None:
-        """Cancel all stop-loss orders."""
+        """Cancel existing stop-loss order."""
         try:
-            for trade in self.ib.openTrades():
-                if trade.contract == self.contract:
-                    if isinstance(trade.order, StopOrder):
+            if self.sl_order_id:
+                for trade in self.ib.openTrades():
+                    if trade.order.orderId == self.sl_order_id:
+                        self.ib.cancelOrder(trade.order)
+                        logger.info(f"Cancelled SL order #{self.sl_order_id}")
+                        break
+                self.sl_order_id = None
+            else:
+                # Fallback: cancel all stop orders for this contract
+                for trade in self.ib.openTrades():
+                    if trade.contract == self.contract and isinstance(trade.order, StopOrder):
                         self.ib.cancelOrder(trade.order)
                         logger.info("Cancelled stop-loss order")
         except Exception as e:
@@ -705,9 +719,10 @@ class LiveTrader:
             "position": self.position,
             "entry_price": self.entry_price,
             "stop_loss_price": self.stop_loss_price,
+            "fixed_sl_ticks": self.fixed_sl_ticks,
+            "sl_order_active": self.sl_order_id is not None,
             "unrealized_pnl": self._calculate_unrealized_pnl(),
             "daily_pnl": self.daily_pnl,
             "account_value": self.account_value,
             "trade_count": self.trade_count,
-            "current_atr": self.current_atr,
         }

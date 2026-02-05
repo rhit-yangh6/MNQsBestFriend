@@ -45,7 +45,7 @@ def load_model_and_config(model_dir: Path):
             training_config = json.load(f)
     else:
         training_config = {
-            "sl_options": [80.0, 120.0, 160.0, 200.0],
+            "fixed_sl_ticks": 120.0,
             "lookback_window": settings.LOOKBACK_WINDOW,
         }
 
@@ -215,9 +215,9 @@ def main():
 
     # Load model configuration
     feature_columns, preprocessor, training_config = load_model_and_config(model_path)
-    sl_options = training_config.get("sl_options", [80.0, 120.0, 160.0, 200.0])
+    fixed_sl_ticks = training_config.get("fixed_sl_ticks", 120.0)
     logger.info(f"Using {len(feature_columns)} features")
-    logger.info(f"SL options: {sl_options}")
+    logger.info(f"Fixed SL: {fixed_sl_ticks} ticks")
 
     # Load model
     logger.info("Loading model...")
@@ -236,7 +236,7 @@ def main():
     dummy_env = TradingEnv(
         df=dummy_df,
         feature_columns=feature_columns,
-        sl_options=sl_options,
+        fixed_sl_ticks=fixed_sl_ticks,
     )
 
     agent = TradingAgent(algorithm="PPO")
@@ -249,7 +249,7 @@ def main():
             model=agent,
             feature_columns=feature_columns,
             preprocessor=preprocessor,
-            sl_options=sl_options,
+            fixed_sl_ticks=fixed_sl_ticks,
             lookback_window=settings.LOOKBACK_WINDOW,
             max_position=args.max_position,
             max_daily_loss=args.max_daily_loss,

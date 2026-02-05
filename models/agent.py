@@ -41,6 +41,7 @@ class TradingAgent:
         feature_extractor: str = "lstm",
         learning_rate: float = 3e-4,
         batch_size: int = 64,
+        n_steps: int = 8192,
         n_epochs: int = 10,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
@@ -61,6 +62,7 @@ class TradingAgent:
             feature_extractor: Type of feature extractor ('lstm', 'attention')
             learning_rate: Learning rate
             batch_size: Batch size for training
+            n_steps: Steps per environment per update (default 4096)
             n_epochs: Number of epochs per update
             gamma: Discount factor
             gae_lambda: GAE lambda parameter
@@ -69,7 +71,6 @@ class TradingAgent:
             vf_coef: Value function coefficient
             max_grad_norm: Maximum gradient norm for clipping
             tensorboard_log: TensorBoard log directory
-            tensorboard_log: TensorBoard log directory
             device: Device to use ('cpu', 'cuda', 'mps', 'auto')
             seed: Random seed
         """
@@ -77,6 +78,7 @@ class TradingAgent:
         self.feature_extractor_type = feature_extractor
         self.learning_rate = learning_rate
         self.batch_size = batch_size
+        self.n_steps = n_steps
         self.n_epochs = n_epochs
         self.gamma = gamma
         self.gae_lambda = gae_lambda
@@ -121,7 +123,7 @@ class TradingAgent:
                 policy="MultiInputPolicy",
                 env=self.vec_env,
                 learning_rate=self.learning_rate,
-                n_steps=2048,
+                n_steps=self.n_steps,
                 batch_size=self.batch_size,
                 n_epochs=self.n_epochs,
                 gamma=self.gamma,
@@ -255,7 +257,12 @@ class TradingAgent:
 
         # Evaluation callback
         if eval_env is not None:
-            eval_vec_env = DummyVecEnv([lambda: Monitor(eval_env)])
+            # Check if already a VecEnv (e.g., VecNormalize wrapped)
+            from stable_baselines3.common.vec_env import VecEnv
+            if isinstance(eval_env, VecEnv):
+                eval_vec_env = eval_env
+            else:
+                eval_vec_env = DummyVecEnv([lambda: Monitor(eval_env)])
             eval_callback = EvaluationCallback(
                 eval_env=eval_vec_env,
                 n_eval_episodes=n_eval_episodes,
@@ -329,6 +336,8 @@ class TradingAgent:
         Returns:
             Evaluation metrics
         """
+        from tqdm import tqdm
+
         if self.model is None:
             raise ValueError("Model not initialized")
 
@@ -339,18 +348,22 @@ class TradingAgent:
         episode_trades = []
         episode_profits = []
 
-        for _ in range(n_episodes):
+        for ep in tqdm(range(n_episodes), desc="Evaluating", unit="ep"):
             obs, _ = env.reset()
             done = False
             total_reward = 0
             length = 0
 
+            pbar = tqdm(desc=f"Episode {ep+1}", unit="step", leave=False)
             while not done:
                 action, _ = self.predict(obs, deterministic=deterministic)
                 obs, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
                 total_reward += reward
                 length += 1
+                pbar.update(1)
+                pbar.set_postfix({"pnl": f"${info.get('realized_pnl', 0):.2f}"})
+            pbar.close()
 
             episode_rewards.append(total_reward)
             episode_lengths.append(length)

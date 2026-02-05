@@ -141,13 +141,11 @@ class BacktestEngine:
         self._trade_high = 0.0
         self._trade_low = float('inf')
         self._time_in_position = 0
-        self._sl_options = [80.0, 120.0, 160.0, 200.0]
-        self._current_sl_ticks = 0.0
-        self._current_sl_level = 0
+        self._fixed_sl_ticks = 200.0  # Default fixed SL
+        self._current_sl_ticks = 120.0
         self._stop_loss_price = 0.0
         self._sl_hits = 0
         self._max_unrealized_pnl = 0.0
-        self._sl_choices = []
 
     def run(
         self,
@@ -218,17 +216,19 @@ class BacktestEngine:
         feature_columns: List[str],
         lookback_window: int = 50,
         deterministic: bool = True,
-        sl_options: List[float] = None,
+        fixed_sl_ticks: float = 120.0,
+        sl_options: List[float] = None,  # Deprecated - kept for compatibility
     ) -> Dict[str, Any]:
         """
-        Run backtest using a trained RL model with learnable SL.
+        Run backtest using a trained RL model with fixed SL.
 
         Args:
             model: Trained agent with predict() method
             feature_columns: Feature columns for model input
             lookback_window: Lookback window for state
             deterministic: Use deterministic policy
-            sl_options: List of SL options in ticks
+            fixed_sl_ticks: Fixed stop loss in ticks (default 120)
+            sl_options: Deprecated - kept for compatibility
 
         Returns:
             Backtest results
@@ -236,19 +236,17 @@ class BacktestEngine:
         self.reset()
         n_bars = self.n_bars
         self._time_in_position = 0
-        self._sl_options = sl_options or [80.0, 120.0, 160.0, 200.0]
-        self._current_sl_ticks = 0.0
-        self._current_sl_level = 0
+        self._fixed_sl_ticks = fixed_sl_ticks
+        self._current_sl_ticks = fixed_sl_ticks
         self._stop_loss_price = 0.0
         self._sl_hits = 0
         self._max_unrealized_pnl = 0.0
-        self._sl_choices = []
-        
+
         # Pre-convert feature data to numpy
         self._feature_data = self.df[feature_columns].values.astype(np.float32)
 
         logger.info(f"Running model backtest with {n_bars} bars")
-        logger.info(f"SL options: {self._sl_options} ticks")
+        logger.info(f"Fixed SL: {self._fixed_sl_ticks} ticks")
 
         for i in tqdm(range(lookback_window, n_bars), desc="Backtesting", unit="bars"):
             self.current_bar = i
@@ -280,16 +278,14 @@ class BacktestEngine:
             # Prepare observation (optimized)
             obs = self._prepare_observation_fast(i, lookback_window)
 
-            # Get model prediction (MultiDiscrete: [action_type, sl_level])
+            # Get model prediction (Discrete: single action_type)
             action, _ = model.predict(obs, deterministic=deterministic)
 
-            # Parse action
-            if isinstance(action, np.ndarray) and len(action) >= 2:
-                action_type = int(action[0])
-                sl_level = int(action[1])
+            # Parse action (Discrete space returns single int or 0-d array)
+            if isinstance(action, np.ndarray):
+                action_type = int(action.item()) if action.ndim == 0 else int(action[0])
             else:
-                action_type = int(action[0]) if isinstance(action, np.ndarray) else int(action)
-                sl_level = 1  # Default medium
+                action_type = int(action)
 
             # Execute action
             if action_type == 0:  # HOLD
@@ -306,32 +302,27 @@ class BacktestEngine:
                 if (signal == OrderSide.BUY and current_pos == -1) or \
                    (signal == OrderSide.SELL and current_pos == 1):
                     self._close_position_fast(i, close)
-                    self._open_position_with_sl_fast(signal, i, close, sl_level)
+                    self._open_position_with_fixed_sl(signal, i, close)
                 elif current_pos == 0:
-                    self._open_position_with_sl_fast(signal, i, close, sl_level)
+                    self._open_position_with_fixed_sl(signal, i, close)
 
         # Close any open position
         if self.position.quantity != 0:
-            self._close_position(self.df.iloc[-1])
+            last_bar = n_bars - 1
+            self._close_position_fast(last_bar, self.close_prices[last_bar])
 
         results = self._compile_results()
         results["sl_hits"] = self._sl_hits
-        results["sl_choices"] = self._sl_choices
         return results
 
-    def _open_position_with_sl(self, side: OrderSide, bar: pd.Series, sl_level: int = 0) -> None:
-        """Open position and set stop loss based on chosen level."""
+    def _open_position_with_sl(self, side: OrderSide, bar: pd.Series) -> None:
+        """Open position and set fixed stop loss."""
         timestamp = bar.name if hasattr(bar, "name") else self.df.index[self.current_bar]
         self._open_position(side, bar, timestamp)
 
-        # Set SL based on chosen level
-        sl_level = min(sl_level, len(self._sl_options) - 1)
-        self._current_sl_level = sl_level
-        self._current_sl_ticks = self._sl_options[sl_level]
+        # Set fixed SL
+        self._current_sl_ticks = self._fixed_sl_ticks
         sl_points = self._current_sl_ticks * self.tick_size
-
-        # Track SL choice
-        self._sl_choices.append(sl_level)
 
         if side == OrderSide.BUY:
             self._stop_loss_price = self.position.entry_price - sl_points
@@ -439,41 +430,23 @@ class BacktestEngine:
         feature_columns: List[str],
         lookback_window: int,
     ) -> Dict[str, np.ndarray]:
-        """Prepare observation for model (7-element position_info with learnable SL)."""
+        """Prepare observation for model (4-element position_info)."""
         start_idx = current_bar - lookback_window
         market_data = self.df.iloc[start_idx:current_bar][feature_columns].values
-
-        # Normalize unrealized P&L
-        normalized_pnl = self.position.unrealized_pnl / self.initial_capital
 
         # Get time in position
         time_in_position = self._time_in_position if hasattr(self, '_time_in_position') else 0
 
-        # Balance ratio
+        # Equity ratio
         current_equity = self.capital + self.position.unrealized_pnl
-        balance_ratio = current_equity / self.initial_capital
+        equity_ratio = current_equity / self.initial_capital
 
-        # Calculate distance to SL and max P&L ratio
-        if self.position.quantity != 0:
-            sl_points = self._current_sl_ticks * self.tick_size
-            max_loss = sl_points * self.point_value
-            pnl_to_sl_ratio = (self.position.unrealized_pnl + max_loss) / max_loss if max_loss > 0 else 1.0
-            max_pnl_ratio = self.position.unrealized_pnl / max(1.0, self._max_unrealized_pnl) if self._max_unrealized_pnl > 0 else 1.0
-        else:
-            pnl_to_sl_ratio = 1.0
-            max_pnl_ratio = 1.0
-
-        # Normalize current SL level
-        sl_level_norm = self._current_sl_level / max(1, len(self._sl_options) - 1) if self.position.quantity != 0 else 0.5
-
+        # 4-element position_info (simplified)
         position_info = np.array([
-            np.sign(self.position.quantity),
-            normalized_pnl,
-            min(time_in_position / 100, 1.0),
-            balance_ratio,
-            pnl_to_sl_ratio,   # Distance to SL
-            max_pnl_ratio,     # Current P&L vs max P&L in trade
-            sl_level_norm,     # Current SL level (normalized)
+            float(np.sign(self.position.quantity)),
+            self.position.unrealized_pnl / 100.0,  # Normalize ~$100 typical
+            min(time_in_position / 50.0, 2.0),  # Normalize time
+            equity_ratio,
         ], dtype=np.float32)
 
         return {
@@ -486,38 +459,20 @@ class BacktestEngine:
         current_bar: int,
         lookback_window: int,
     ) -> Dict[str, np.ndarray]:
-        """Prepare observation for model (optimized with pre-converted data)."""
+        """Prepare observation for model (optimized, 4-element position_info)."""
         start_idx = current_bar - lookback_window
         market_data = self._feature_data[start_idx:current_bar]
 
-        # Normalize unrealized P&L
-        normalized_pnl = self.position.unrealized_pnl / self.initial_capital
-
-        # Balance ratio
+        # Equity ratio
         current_equity = self.capital + self.position.unrealized_pnl
-        balance_ratio = current_equity / self.initial_capital
+        equity_ratio = current_equity / self.initial_capital
 
-        # Calculate distance to SL and max P&L ratio
-        if self.position.quantity != 0:
-            sl_points = self._current_sl_ticks * self.tick_size
-            max_loss = sl_points * self.point_value
-            pnl_to_sl_ratio = (self.position.unrealized_pnl + max_loss) / max_loss if max_loss > 0 else 1.0
-            max_pnl_ratio = self.position.unrealized_pnl / max(1.0, self._max_unrealized_pnl) if self._max_unrealized_pnl > 0 else 1.0
-        else:
-            pnl_to_sl_ratio = 1.0
-            max_pnl_ratio = 1.0
-
-        # Normalize current SL level
-        sl_level_norm = self._current_sl_level / max(1, len(self._sl_options) - 1) if self.position.quantity != 0 else 0.5
-
+        # 4-element position_info (simplified)
         position_info = np.array([
-            np.sign(self.position.quantity),
-            normalized_pnl,
-            min(self._time_in_position / 100, 1.0),
-            balance_ratio,
-            pnl_to_sl_ratio,
-            max_pnl_ratio,
-            sl_level_norm,
+            float(np.sign(self.position.quantity)),
+            self.position.unrealized_pnl / 100.0,  # Normalize ~$100 typical
+            min(self._time_in_position / 50.0, 2.0),  # Normalize time
+            equity_ratio,
         ], dtype=np.float32)
 
         return {
@@ -546,19 +501,14 @@ class BacktestEngine:
                 # Open short
                 self._open_position_fast(OrderSide.SELL, bar_idx, close, timestamp)
 
-    def _open_position_with_sl_fast(self, side: OrderSide, bar_idx: int, close: float, sl_level: int = 0) -> None:
-        """Open position and set stop loss based on chosen level (optimized)."""
+    def _open_position_with_fixed_sl(self, side: OrderSide, bar_idx: int, close: float) -> None:
+        """Open position and set fixed stop loss (optimized)."""
         timestamp = self.timestamps[bar_idx]
         self._open_position_fast(side, bar_idx, close, timestamp)
 
-        # Set SL based on chosen level
-        sl_level = min(sl_level, len(self._sl_options) - 1)
-        self._current_sl_level = sl_level
-        self._current_sl_ticks = self._sl_options[sl_level]
+        # Set fixed SL
+        self._current_sl_ticks = self._fixed_sl_ticks
         sl_points = self._current_sl_ticks * self.tick_size
-
-        # Track SL choice
-        self._sl_choices.append(sl_level)
 
         if side == OrderSide.BUY:
             self._stop_loss_price = self.position.entry_price - sl_points
@@ -567,6 +517,10 @@ class BacktestEngine:
 
         self._time_in_position = 0
         self._max_unrealized_pnl = 0.0
+
+    def _open_position_with_sl_fast(self, side: OrderSide, bar_idx: int, close: float, sl_level: int = 0) -> None:
+        """Deprecated - kept for compatibility. Use _open_position_with_fixed_sl instead."""
+        self._open_position_with_fixed_sl(side, bar_idx, close)
 
     def _open_position_fast(
         self, side: OrderSide, bar_idx: int, close: float, timestamp: datetime
